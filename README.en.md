@@ -12,7 +12,7 @@ Use Chinese in the native `claude` CLI. Your Chinese reaches Claude only as Engl
 
 ## Features
 
-- **English only to Claude.** A translation model turns your Chinese into English, and only the English is sent. Your row still shows what you typed, with a `↳ …` line underneath showing exactly what was sent.
+- **English only to Claude.** A translation model turns your Chinese into English, and only the English is sent. Your row still shows what you typed, and the line starting with ↳ underneath shows exactly what was sent.
 - **Chinese replies.** Claude replies in English. Each block is translated in the background as soon as it's finished, then shown in Chinese in place. You can also keep the English with the Chinese below it.
 - **Untouched content.** Code blocks, tables, paths and commands are kept as-is.
 - **English stays English.** English messages go through unchanged, and their replies aren't translated.

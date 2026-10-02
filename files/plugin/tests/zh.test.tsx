@@ -285,9 +285,9 @@ test('设置菜单：按下就生效并保存，当前项标 ●；换模型跳�
   fake(on, files, seen)
 
   const desk = await $.ui.mount({ plugin: 'zh-translate', surface: 'desktop', component: 'Pane', requestId: 'zh-settings', props: { title: '中文翻译设置' } })
-  expect((await desk.findAll({ type: 'Button' })).length).toBe(8)
+  expect((await desk.findAll({ type: 'Button' })).length).toBe(10)
   const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-settings', props: { title: '中文翻译设置' } })
-  expect((await pane.findAll({ type: 'Button' })).length).toBe(8)
+  expect((await pane.findAll({ type: 'Button' })).length).toBe(10)
   const label = async (key: string) => String((await pane.find({ key }))?.props?.label ?? JSON.stringify(await pane.find({ key })))
   expect((await label('only')).includes('●')).toBe(true)
   expect((await label('both')).includes('○')).toBe(true)
@@ -335,4 +335,42 @@ test('非交互会话（claude -p）：/zh 直接回状态文字，不去开菜�
   const r = await $.command.run({ command: 'zh', args: '', ...RUN })
   expect(String(r.text).includes('中文翻译已开启')).toBe(true)
   expect(seen.opened ?? []).toEqual([])
+})
+
+// ---------- 第四轮：显示 / 不显示翻译费用 ----------
+
+test('关掉显示费用：回复、菜单、状态文字都不显示金额；both 模式的分隔线照留；打开后恢复', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+
+  await $.prompt.submit({ text: '帮我看看日志', wait: false, origin: { kind: 'composer' } })
+  const en = 'The log shows a timeout.'
+  await reply($, en, 'c1')
+  const m = await mountReply($, en)
+  expect((await drawnUntil(m, '翻译费用')).includes('翻译费用')).toBe(true)
+
+  const off = await $.command.run({ command: 'zh', args: 'cost off', ...RUN })
+  expect(String(off.text).includes('不显示费用')).toBe(true)
+  expect(String(off.text).includes('$')).toBe(false)
+  expect(JSON.parse(files[CONFIG] ?? '{}').showCost).toBe(false)
+  const only = textOf(await m.drawn())
+  expect(only.includes('中文：The log shows a timeout.')).toBe(true)
+  expect(only.includes('翻译费用')).toBe(false)
+  expect(only.includes('$')).toBe(false)
+
+  await $.command.run({ command: 'zh', args: 'both', ...RUN })
+  const both = textOf(await m.drawn())
+  expect(both.includes('───── 中文 ─────')).toBe(true)
+  expect(both.includes('本条')).toBe(false)
+
+  const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-settings', props: { title: '中文翻译设置' } })
+  const menu = textOf(await pane.drawn())
+  expect(menu.includes('本会话翻译累计')).toBe(false)
+  expect(String((await pane.find({ key: 'cost-off' }))?.props?.label).includes('●')).toBe(true)
+
+  await pane.press({ key: 'cost-on' })
+  expect(JSON.parse(files[CONFIG] ?? '{}').showCost).toBe(true)
+  expect(textOf(await m.drawn()).includes('本条')).toBe(true)
+  expect(textOf(await pane.drawn()).includes('本会话翻译累计')).toBe(true)
 })

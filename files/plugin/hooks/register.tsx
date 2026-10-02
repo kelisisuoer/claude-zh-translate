@@ -14,7 +14,7 @@ const CJK = /[㐀-鿿豈-﫿]/
 const CJK_G = /[㐀-鿿豈-﫿]/g
 const FENCE = /^[ \t]*(```|~~~)[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*$/gm
 
-const DEFAULT_CONFIG: Config = { enabled: true, mode: 'only', scope: 'all', model: 'sonnet' }
+const DEFAULT_CONFIG: Config = { enabled: true, mode: 'only', scope: 'all', model: 'sonnet', showCost: true }
 const configAtom = atom({ plugin: 'zh-translate', key: 'config' } as const, DEFAULT_CONFIG)
 const sentAtom = atom({ plugin: 'zh-translate', key: 'sent' } as const, {} as Record<string, string>)
 const repliesAtom = atom({ plugin: 'zh-translate', key: 'replies' } as const, {} as Record<string, Translation>)
@@ -151,7 +151,8 @@ function statusText(c: Config, spent: number): string {
     ? `只译最后的回复（你的消息照常翻译，中间过程不翻译）；${c.mode === 'both' ? '英文下面附中文' : '只显示中文'}`
     : c.mode === 'both' ? '每条回复英文下面附中文' : '每条回复只显示中文'
   const state = c.enabled ? `已开启（${show}）` : '已关闭'
-  return `中文翻译${state}，翻译模型：${modelName(c.model)}，本会话翻译累计 ${usd(spent)}。\n命令：/zh on | off | only | both | all | final，/zh-model 选翻译模型`
+  const cost = c.showCost ? `本会话翻译累计 ${usd(spent)}` : '不显示费用'
+  return `中文翻译${state}，翻译模型：${modelName(c.model)}，${cost}。\n命令：/zh on | off | only | both | all | final | cost on | cost off，/zh-model 选翻译模型`
 }
 
 // ---------- 读写文件（家目录和临时目录只问一次） ----------
@@ -291,12 +292,13 @@ export const register: Register = on => {
     let note = ''
     if (!a) {
       // 不带参数：打开设置菜单
-      const opened = await openPane($, SETTINGS, '中文翻译设置', 13)
+      const opened = await openPane($, SETTINGS, '中文翻译设置', 15)
       return { text: opened ? '用上下键或 Tab 选择，回车切换，Esc 关闭。' : statusText(c, await read($, spentAtom)) }
     }
     if (a === 'on' || a === 'off') c = await saveConfig($, { enabled: a === 'on' })
     else if (a === 'only' || a === 'both') c = await saveConfig($, { enabled: true, mode: a })
     else if (a === 'all' || a === 'final') c = await saveConfig($, { enabled: true, scope: a })
+    else if (/^cost\s+(on|off)$/.test(a)) c = await saveConfig($, { showCost: a.endsWith('on') })
     else if (a.startsWith('model ')) { note = (await switchModel($, a.slice(6).trim())) + '。'; c = await getConfig($) }
     else note = `不认识“${a}”。`
     return { text: note + statusText(c, await read($, spentAtom)) }
@@ -322,7 +324,7 @@ export const register: Register = on => {
     }
     return (
       <Box flexDirection="column">
-        <Text dimColor>本会话翻译累计 {usd(spent)}。上下键或 Tab 选择，回车切换，Esc 关闭。</Text>
+        <Text dimColor>{c.showCost ? `本会话翻译累计 ${usd(spent)}。` : ''}上下键或 Tab 选择，回车切换，Esc 关闭。</Text>
         <Text bold>翻译</Text>
         <Box flexDirection="row" columnGap={2}>
           {choice('on', '开启', c.enabled, set({ enabled: true }), '1')}
@@ -338,9 +340,14 @@ export const register: Register = on => {
           {choice('all', '每条回复', c.scope === 'all', set({ enabled: true, scope: 'all' }), '5')}
           {choice('final', '只翻每轮最后的回复', c.scope === 'final', set({ enabled: true, scope: 'final' }), '6')}
         </Box>
+        <Text bold>显示翻译费用</Text>
+        <Box flexDirection="row" columnGap={2}>
+          {choice('cost-on', '显示', c.showCost, set({ showCost: true }), '7')}
+          {choice('cost-off', '不显示', !c.showCost, set({ showCost: false }), '8')}
+        </Box>
         <Text bold>翻译模型：{modelName(c.model)}</Text>
         <Box flexDirection="row" columnGap={2}>
-          <Button key="model" hotkey="7" label="换模型…" onPress={toModels} />
+          <Button key="model" hotkey="9" label="换模型…" onPress={toModels} />
           <Button key="done" hotkey="0" role="dismiss" label="完成" onPress={() => $.ui.close({ id: SETTINGS })} />
         </Box>
       </Box>
@@ -448,10 +455,11 @@ export const register: Register = on => {
     if (!c.enabled || !tr) return next(e)
     if (tr.pending) return next({ ...e, props: { ...e.props, text: `${e.props.text}\n\n*（翻译中…）*` } })
     if (!tr.zh) return next({ ...e, props: { ...e.props, text: `${e.props.text}\n\n*（中文翻译失败：${tr.error}）*` } })
-    const cost = `本条 ${usd(tr.cost)} · 本会话翻译累计 ${usd(await read($, spentAtom))}`
+    // 关了“显示翻译费用”就不写金额；both 模式的分隔线照留
+    const cost = c.showCost ? `本条 ${usd(tr.cost)} · 本会话翻译累计 ${usd(await read($, spentAtom))}` : ''
     const text = c.mode === 'both'
-      ? `${e.props.text}\n\n───── 中文 ───── ${cost}\n\n${tr.zh}`
-      : `${tr.zh}\n\n*（翻译费用：${cost}）*`
+      ? `${e.props.text}\n\n───── 中文 ─────${cost ? ` ${cost}` : ''}\n\n${tr.zh}`
+      : cost ? `${tr.zh}\n\n*（翻译费用：${cost}）*` : tr.zh
     return next({ ...e, props: { ...e.props, text } })
   })
 }

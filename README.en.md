@@ -18,7 +18,7 @@ Use Chinese in the native `claude` CLI. Your Chinese reaches Claude only as Engl
 - **English stays English.** English messages go through unchanged, and their replies aren't translated.
 - **Menus for settings.** `/zh` opens a settings menu and `/zh-model` picks the translation model. Changes apply immediately.
 - **Consistent wording.** A glossary keeps terms consistent, and reply translations reuse the wording of your own message.
-- **Visible cost.** You can see each translation's cost and the session total, optionally in your status line.
+- **Visible cost.** You can see each translation's cost and the session total, optionally in your status line. If you'd rather not see amounts, turn them off in `/zh`.
 
 ## How it works
 
@@ -48,16 +48,17 @@ If you used the earlier version (the one built on hooks in settings.json), the i
 
 Just ask in Chinese. Use `/zh` for settings:
 
-<img src="docs/menu.svg" width="620" alt="Illustration: the /zh settings menu, with on/off, how replies are shown, which replies are translated, and the translation model">
+<img src="docs/menu.svg" width="620" alt="Illustration: the /zh settings menu, with on/off, how replies are shown, which replies are translated, whether costs are shown, and the translation model">
 
 | Command | What it does |
 |---|---|
-| `/zh` | Opens the settings menu: on/off, how replies are shown, which replies are translated, translation model. Move with the arrow keys or Tab, press Enter to choose, Esc to close |
+| `/zh` | Opens the settings menu: on/off, how replies are shown, which replies are translated, whether costs are shown, translation model. Move with the arrow keys or Tab, press Enter to choose, Esc to close |
 | `/zh on` / `/zh off` | Turn translation on / off |
 | `/zh only` | Show replies in Chinese only (default) |
-| `/zh both` | Show the English reply with the Chinese and its cost below |
+| `/zh both` | Show the English reply with the Chinese below |
 | `/zh all` | Translate every reply (default) |
 | `/zh final` | Translate only the last reply of each turn; Claude's working messages stay in English. Your messages are still translated |
+| `/zh cost on` / `/zh cost off` | Show / hide translation costs. When off, no amounts appear under replies, in the menu or in the status line |
 | `/zh-model` | Opens a list to pick the translation model; Enter to confirm, Esc to cancel |
 | `/zh model <model ID>` | Switch models without the menu, e.g. `/zh model claude-haiku-4-5` |
 
@@ -73,7 +74,7 @@ Notes:
 
 ### Status line (optional)
 
-If you use [ccstatusline](https://github.com/sirmalloc/ccstatusline), add a "custom command" widget to show something like `译: Sonnet 5.5 $0.012`: the current translation model and this session's translation cost. The installer prints the exact command at the end; it looks like this:
+If you use [ccstatusline](https://github.com/sirmalloc/ccstatusline), add a "custom command" widget to show something like `译: Sonnet 5.5 $0.012`: the current translation model and this session's translation cost (just the model when costs are turned off). The installer prints the exact command at the end; it looks like this:
 
 ```
 "<path to node>" "<home>/.claude/zh-translate/status.mjs"
@@ -97,6 +98,11 @@ The `/zh-model` list shows an estimated price per reply block for each version. 
 - **The conversation is saved in English.** Both your messages and Claude's replies are stored in English; the Chinese is only how they're displayed. The plugin keeps a copy of the session's translations, so a resumed session still shows Chinese where it can.
 - **Some things stay in English:** tool calls, Claude's thinking, and permission prompts.
 - **`claude -p` (scripted runs) has no screen.** `/zh` and `/zh-model` reply with text only, and with the `all` scope, the last reply's translation may not finish before the program exits.
+
+## Changelog
+
+- **0.3.0**: Choose whether translation costs are shown (the "显示翻译费用" group in the `/zh` menu, or `/zh cost on` / `/zh cost off`).
+- **0.2.0**: Rebuilt as a Claude Code plugin. Your Chinese reaches Claude only as English, replies are shown in Chinese in place, and there's a `/zh` settings menu and a `/zh-model` model list.
 
 ## Uninstall
 

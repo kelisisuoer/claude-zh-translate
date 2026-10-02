@@ -8,6 +8,8 @@ export type Config = {
   scope: 'all' | 'final'
   /** 翻译用的模型：别名或完整 ID */
   model: string
+  /** 是否显示翻译费用（回复下面、菜单、状态栏） */
+  showCost: boolean
 }
 
 /** 一条回复（英文文本块）的翻译 */

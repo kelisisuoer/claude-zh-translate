@@ -29,4 +29,5 @@ try {
 }
 
 const model = config.model || 'sonnet';
-process.stdout.write(`译: ${prettyName(model)} $${total.toFixed(3)}`);
+// 设置里关了“显示翻译费用”就只显示模型
+process.stdout.write(config.showCost === false ? `译: ${prettyName(model)}` : `译: ${prettyName(model)} $${total.toFixed(3)}`);

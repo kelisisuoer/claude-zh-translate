@@ -95,7 +95,7 @@ ok(`插件已装到 ${PLUGIN}`);
 fs.mkdirSync(DATA, { recursive: true });
 fs.copyFileSync(path.join(SRC, 'zh-translate', 'status.mjs'), path.join(DATA, 'status.mjs'));
 if (!fs.existsSync(path.join(DATA, 'glossary.txt'))) fs.copyFileSync(path.join(SRC, 'zh-translate', 'glossary.txt'), path.join(DATA, 'glossary.txt'));
-let config = { enabled: true, mode: 'only', scope: 'all', model: 'sonnet' };
+let config = { enabled: true, mode: 'only', scope: 'all', model: 'sonnet', showCost: true };
 try { config = { ...config, ...readJson(path.join(DATA, 'config.json')) }; } catch {}
 delete config.claudeCmd; // 旧版用的，插件不需要
 fs.writeFileSync(path.join(DATA, 'config.json'), JSON.stringify(config, null, 2));

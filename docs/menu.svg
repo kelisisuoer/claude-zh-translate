@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="/zh 设置菜单：开关、回复怎么显示、翻译哪些回复、翻译模型">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="490" viewBox="0 0 760 490" role="img" aria-label="/zh 设置菜单：开关、回复怎么显示、翻译哪些回复、是否显示翻译费用、翻译模型">
   <style>
     text { font-family: "Cascadia Mono", Consolas, Menlo, "DejaVu Sans Mono", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", monospace; font-size: 15px; fill: #e6e6e6; }
     .dim { fill: #8b919c; font-size: 13px; }
@@ -6,8 +6,8 @@
     .on { fill: #d97757; font-weight: 700; }
     .title { fill: #9aa0aa; font-size: 13px; }
   </style>
-  <rect width="760" height="420" rx="12" fill="#1a1b26"/>
-  <rect x="16" y="16" width="728" height="360" rx="8" fill="none" stroke="#3b3d55"/>
+  <rect width="760" height="490" rx="12" fill="#1a1b26"/>
+  <rect x="16" y="16" width="728" height="430" rx="8" fill="none" stroke="#3b3d55"/>
   <rect x="32" y="8" width="132" height="18" fill="#1a1b26"/>
   <text x="40" y="22" class="title">中文翻译设置</text>
 
@@ -25,11 +25,15 @@
   <text x="36" y="258" class="on">[ ● 每条回复 ]</text>
   <text x="174" y="258">[ ○ 只翻每轮最后的回复 ]</text>
 
-  <text x="36" y="300" class="head">翻译模型：Sonnet 5.5</text>
-  <rect x="30" y="311" width="116" height="26" rx="3" fill="#3b3d55"/>
-  <text x="36" y="329">[ 换模型… ]</text>
-  <text x="158" y="329">[ 完成 ]</text>
+  <text x="36" y="300" class="head">显示翻译费用</text>
+  <text x="36" y="328" class="on">[ ● 显示 ]</text>
+  <text x="142" y="328">[ ○ 不显示 ]</text>
 
-  <text x="36" y="356" class="dim">数字键 1–7 直接选中对应项，0 完成。</text>
-  <text x="20" y="404" class="dim">示意图：输入 /zh 后出现的设置菜单。Illustration: the menu that opens after typing /zh.</text>
+  <text x="36" y="370" class="head">翻译模型：Sonnet 5.5</text>
+  <rect x="30" y="381" width="116" height="26" rx="3" fill="#3b3d55"/>
+  <text x="36" y="399">[ 换模型… ]</text>
+  <text x="158" y="399">[ 完成 ]</text>
+
+  <text x="36" y="426" class="dim">数字键 1–9 直接选中对应项，0 完成。</text>
+  <text x="20" y="474" class="dim">示意图：输入 /zh 后出现的设置菜单。Illustration: the menu that opens after typing /zh.</text>
 </svg>

@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-label="Claude Code 中文翻译示意：你打中文，Claude 收到英文，回复显示成中文">
+  <style>
+    text { font-family: "Cascadia Mono", Consolas, Menlo, "DejaVu Sans Mono", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", monospace; font-size: 15px; fill: #e6e6e6; }
+    .dim { fill: #8b919c; }
+    .small { font-size: 13px; }
+    .title { fill: #9aa0aa; font-size: 13px; }
+    .tool { fill: #8bd49c; }
+    .accent { fill: #d97757; }
+    .status { font-size: 13px; fill: #9aa0aa; }
+  </style>
+  <rect width="960" height="540" rx="12" fill="#1a1b26"/>
+  <rect width="960" height="36" rx="12" fill="#24253a"/>
+  <rect y="24" width="960" height="12" fill="#24253a"/>
+  <circle cx="22" cy="18" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="18" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="18" r="6" fill="#28c840"/>
+  <text x="480" y="23" text-anchor="middle" class="title">claude — ~/my-project</text>
+
+  <!-- 你的消息：显示你打的中文，下面一行是发给 Claude 的英文 -->
+  <rect x="20" y="54" width="920" height="58" rx="6" fill="#2a2c3d"/>
+  <text x="34" y="78">&gt; 日志里一直报 code 8，帮我看看是什么原因，先别改代码</text>
+  <text x="34" y="101" class="dim">  ↳ The logs keep reporting code 8. Can you check what's causing it? Don't change the code yet.</text>
+
+  <!-- 中间的工作消息，也已译成中文 -->
+  <text x="20" y="146" class="accent">●</text>
+  <text x="40" y="146">我先在登录日志里搜一下 code 8。</text>
+  <text x="40" y="168" class="dim small">（翻译费用：本条 $0.0009 · 本会话翻译累计 $0.0023）</text>
+
+  <!-- 工具调用保持原样 -->
+  <text x="20" y="206" class="tool">●</text>
+  <text x="40" y="206">Bash(grep -n "code 8" logs/login.log)</text>
+  <text x="40" y="228" class="dim">⎿  212: Error: session taken over (code 8)</text>
+
+  <!-- 最后的回复，译成中文 -->
+  <text x="20" y="268" class="accent">●</text>
+  <text x="40" y="268">code 8 表示被顶号：同一个老板号在另一台设备上登录，当前会话被挤下线。</text>
+  <text x="40" y="292">建议遇到 code 8 时暂停任务，在卡片上提示“被顶号”，不要自动重试：</text>
+  <rect x="40" y="304" width="560" height="52" rx="4" fill="#222336"/>
+  <text x="54" y="326" class="tool">if resp.Code == 8 {</text>
+  <text x="90" y="346" class="tool">task.Pause("被顶号")  // 代码原样保留</text>
+  <text x="40" y="380" class="dim small">（翻译费用：本条 $0.0031 · 本会话翻译累计 $0.0054）</text>
+
+  <!-- 输入框 -->
+  <rect x="20" y="410" width="920" height="40" rx="6" fill="none" stroke="#3b3d55"/>
+  <text x="34" y="436">&gt; </text>
+  <rect x="52" y="422" width="9" height="18" fill="#e6e6e6"/>
+
+  <!-- 状态栏 -->
+  <text x="20" y="480" class="status">模型: Opus 5.5 | 上下文: 58.0k | 费用: $0.42 | 5H: 12.5% | 周额度: 31.2% | 译: Sonnet 5.5 $0.005</text>
+  <text x="20" y="516" class="dim small">示意图，内容根据插件的实际输出绘制。Illustration based on the plugin's real output.</text>
+</svg>

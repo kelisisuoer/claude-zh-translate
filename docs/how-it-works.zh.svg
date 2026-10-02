@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="380" viewBox="0 0 960 380" role="img" aria-label="工作原理：发送时中文译成英文，只把英文发给 Claude；回复时英文译成中文显示">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#6b7280"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif; fill: #1f2328; }
+    .lane { font-size: 15px; font-weight: 600; fill: #57606a; }
+    .box { font-size: 16px; font-weight: 600; }
+    .sub { font-size: 13px; fill: #57606a; }
+    .note { font-size: 14px; fill: #57606a; }
+  </style>
+  <rect x="1" y="1" width="958" height="378" rx="14" fill="#ffffff" stroke="#d0d7de" stroke-width="2"/>
+
+  <!-- 发送 -->
+  <text x="36" y="84" class="lane">发送</text>
+  <rect x="100" y="48" width="220" height="64" rx="10" fill="#fff4ec" stroke="#d97757"/>
+  <text x="210" y="78" text-anchor="middle" class="box">你输入中文</text>
+  <text x="210" y="99" text-anchor="middle" class="sub">屏幕上照样显示你打的中文</text>
+  <line x1="320" y1="80" x2="380" y2="80" stroke="#6b7280" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="384" y="48" width="220" height="64" rx="10" fill="#eef6ff" stroke="#3b82f6"/>
+  <text x="494" y="78" text-anchor="middle" class="box">翻译模型</text>
+  <text x="494" y="99" text-anchor="middle" class="sub">默认 Sonnet 5.5，/zh-model 可换</text>
+  <line x1="604" y1="80" x2="664" y2="80" stroke="#6b7280" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="668" y="48" width="252" height="64" rx="10" fill="#f0fdf4" stroke="#22a06b"/>
+  <text x="794" y="78" text-anchor="middle" class="box">Claude 只收到英文</text>
+  <text x="794" y="99" text-anchor="middle" class="sub">代码、日志、路径原样带过去</text>
+
+  <!-- Claude 工作 -->
+  <line x1="794" y1="112" x2="794" y2="176" stroke="#6b7280" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="782" y="150" text-anchor="end" class="sub">Claude 用英文思考、调用工具、回复</text>
+
+  <!-- 回复 -->
+  <text x="36" y="216" class="lane">回复</text>
+  <rect x="668" y="180" width="252" height="64" rx="10" fill="#f0fdf4" stroke="#22a06b"/>
+  <text x="794" y="210" text-anchor="middle" class="box">英文回复写完一段</text>
+  <text x="794" y="231" text-anchor="middle" class="sub">先照常显示英文</text>
+  <line x1="668" y1="212" x2="608" y2="212" stroke="#6b7280" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="384" y="180" width="220" height="64" rx="10" fill="#eef6ff" stroke="#3b82f6"/>
+  <text x="494" y="210" text-anchor="middle" class="box">翻译模型</text>
+  <text x="494" y="231" text-anchor="middle" class="sub">参考你的原话和词表统一用词</text>
+  <line x1="384" y1="212" x2="324" y2="212" stroke="#6b7280" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="100" y="180" width="220" height="64" rx="10" fill="#fff4ec" stroke="#d97757"/>
+  <text x="210" y="210" text-anchor="middle" class="box">原处换成中文</text>
+  <text x="210" y="231" text-anchor="middle" class="sub">或英文下面附中文</text>
+
+  <line x1="36" y1="282" x2="924" y2="282" stroke="#d0d7de"/>
+  <text x="36" y="314" class="note">· 只改屏幕上的显示，对话记录保存的是英文　· 代码块、表格、路径、命令保持原样</text>
+  <text x="36" y="342" class="note">· 英文消息不翻译　· /zh final 时只翻每轮最后的回复　· 翻译走你自己登录的 Claude 账号</text>
+</svg>

@@ -1,0 +1,6 @@
+{
+  "name": "zh-translate",
+  "version": "0.2.0",
+  "description": "用中文和 Claude Code 对话：你的中文只以英文发给 Claude，回复在原处显示成中文",
+  "types": "./types/index.d.ts"
+}

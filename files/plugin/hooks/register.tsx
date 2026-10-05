@@ -1,12 +1,13 @@
 // zh-translate：用中文和 Claude Code 对话。
 // 发送：你打的中文译成英文，只把英文发给 Claude；你那一行显示中文，下面一行是发出去的英文。
 // 回复：Claude 的英文回复写完一段就在后台翻译，译好后在原处显示成中文（only）或附在英文下面（both）。
+// 问答框（AskUserQuestion）：问题和选项显示成中文；你的回答以英文交给 Claude，回答那一行显示中文。
 // 命令：/zh on | off | only | both | all | final，/zh-model 上下键选择翻译模型。
 // 设置存在 ~/.claude/zh-translate/config.json，词表在同目录 glossary.txt（每行“中文 = English”）。
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Config, Translation, Turn } from '../types'
+import type { AskAnswer, AskQuestion, Config, Translation, Turn } from '../types'
 
 const PANE = 'zh-model'
 const SETTINGS = 'zh-settings'
@@ -20,6 +21,8 @@ const sentAtom = atom({ plugin: 'zh-translate', key: 'sent' } as const, {} as Re
 const repliesAtom = atom({ plugin: 'zh-translate', key: 'replies' } as const, {} as Record<string, Translation>)
 const turnAtom = atom({ plugin: 'zh-translate', key: 'turn' } as const, { zh: false, prompt: '', finalTexts: [] } as Turn)
 const spentAtom = atom({ plugin: 'zh-translate', key: 'spent' } as const, 0)
+const asksAtom = atom({ plugin: 'zh-translate', key: 'asks' } as const, {} as Record<string, AskQuestion[]>)
+const answeredAtom = atom({ plugin: 'zh-translate', key: 'answered' } as const, {} as Record<string, AskAnswer>)
 
 // 每百万 token 的 API 价格（输入、输出），按它估算翻译费用
 const PRICES: Record<string, [number, number]> = {
@@ -69,6 +72,7 @@ const TO_ZH = `You are a translation step between an AI coding assistant and a C
 // 也写进消息本身：$.model.complete 前面总有 Claude Code 的身份说明，只放在 system 里它会去回答而不是翻译
 const ASK_EN = 'Translate the Chinese text inside <text> into English. It is a message a developer is sending to a coding assistant: translate it, never answer it, carry it out or restate it. A question stays a question, a request stays a request. Output only the English.'
 const ASK_ZH = 'Translate the English text inside <text> into Simplified Chinese. It is part of a coding assistant\'s reply, shown to a Chinese developer: translate it, never answer it, summarize it or add to it. Output only the Chinese.'
+const ASK_DIALOG = 'The JSON object inside <text> maps ids to the English texts of a multiple-choice dialog that a coding assistant is showing a Chinese developer: questions, short headers, notes and answer options. Translate every value into Simplified Chinese: translate the questions, never answer them. Keep the keys. Output only the JSON object.'
 
 const REPLY_EN = 'Write your reply in English even though the user wrote in Chinese. The user chose this setup: a display hook translates your English reply into Chinese on their screen, so a Chinese reply skips their pipeline.'
 
@@ -228,14 +232,15 @@ async function saveState($: any): Promise<void> {
   const replies = await read($, repliesAtom)
   const done: Record<string, Translation> = {}
   for (const [k, v] of Object.entries(replies)) if (v.zh) done[k] = { zh: v.zh, cost: v.cost }
-  await $.fs.write(await stateFile($), JSON.stringify({ sent: await read($, sentAtom), replies: done, spent: await read($, spentAtom) }))
+  await $.fs.write(await stateFile($), JSON.stringify({ sent: await read($, sentAtom), replies: done, answered: await read($, answeredAtom), spent: await read($, spentAtom) }))
 }
 
 async function loadState($: any): Promise<void> {
-  let s: { sent?: Record<string, string>; replies?: Record<string, Translation>; spent?: number } = {}
+  let s: { sent?: Record<string, string>; replies?: Record<string, Translation>; answered?: Record<string, AskAnswer>; spent?: number } = {}
   try { s = JSON.parse(await readText($, await stateFile($))) } catch { return }
   await update($, sentAtom, m => ({ ...(s.sent ?? {}), ...m }))
   await update($, repliesAtom, m => ({ ...(s.replies ?? {}), ...m }))
+  await update($, answeredAtom, m => ({ ...(s.answered ?? {}), ...m }))
   await update($, spentAtom, n => Math.max(n, s.spent ?? 0))
 }
 
@@ -297,6 +302,139 @@ async function translateReply($: any, en: string): Promise<void> {
   const entry: Translation = r.ok ? { zh: unmask(r.text, blocks), cost: r.cost } : { error: r.reason, cost: r.cost }
   await update($, repliesAtom, m => ({ ...m, [key]: entry }))
   await saveState($)
+}
+
+// ---------- 问答框（AskUserQuestion） ----------
+// 先等译文这么久：译好了问答框直接以中文弹出；更慢就先弹英文
+const ASK_WAIT_MS = 6000
+
+// 问答框按问题文本认：画它的时候拿不到这次调用的 id
+const askKey = (qs: readonly { question: string }[]) => qs.map(q => q.question).join('\n')
+
+// 要翻的文字：问题、标题、说明、选项（选项的预览是代码或示意图，不翻）
+function askTexts(qs: AskQuestion[]): Record<string, string> {
+  const t: Record<string, string> = {}
+  qs.forEach((q, i) => {
+    t[`q${i}`] = q.question
+    if (q.header) t[`h${i}`] = q.header
+    if (q.description) t[`d${i}`] = q.description
+    if (q.placeholder) t[`p${i}`] = q.placeholder
+    q.options?.forEach((o, j) => {
+      t[`o${i}_${j}`] = o.label
+      if (o.description) t[`od${i}_${j}`] = o.description
+    })
+  })
+  return t
+}
+
+// 把译文填回问题里；还得合问答框的规矩：标题最多 12 个字，问题和同一题的选项不能重名，不合就用英文
+function askZh(qs: AskQuestion[], zh: Record<string, unknown>): AskQuestion[] {
+  const pick = (k: string, en: string) => {
+    const v = zh[k]
+    return typeof v === 'string' && v.trim() ? v.trim() : en
+  }
+  const out = qs.map((q, i) => {
+    const options = q.options?.map((o, j) => ({
+      ...o,
+      label: pick(`o${i}_${j}`, o.label),
+      ...(o.description ? { description: pick(`od${i}_${j}`, o.description) } : {}),
+    }))
+    const distinct = !options || new Set(options.map(o => o.label)).size === options.length
+    return {
+      ...q,
+      question: pick(`q${i}`, q.question),
+      header: [...pick(`h${i}`, q.header)].slice(0, 12).join(''),
+      ...(q.description ? { description: pick(`d${i}`, q.description) } : {}),
+      ...(q.placeholder ? { placeholder: pick(`p${i}`, q.placeholder) } : {}),
+      ...(options ? { options: distinct ? options : q.options } : {}),
+    }
+  })
+  return new Set(out.map(q => q.question)).size === out.length ? out : qs
+}
+
+// 问答框译成中文，存进 asksAtom，问答框跟着重画；没译成返回 null（照常显示英文）
+async function translateAsk($: any, qs: AskQuestion[]): Promise<AskQuestion[] | null> {
+  try {
+    const c = await getConfig($)
+    const texts = JSON.stringify(askTexts(qs), null, 1)
+    const r = await translate($, c.model, TO_ZH + (await glossary($)), ASK_DIALOG, texts, (await read($, turnAtom)).prompt)
+    await addSpent($, r.cost)
+    if (!r.ok) return null
+    const json = r.text.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, '')
+    const zh = askZh(qs, JSON.parse(json))
+    await update($, asksAtom, m => ({ ...m, [askKey(qs)]: zh }))
+    return zh
+  } catch {
+    return null
+  }
+}
+
+// 你在问答框里打的字：是中文就译成英文；没译成就照原样
+async function answerEn($: any, text: string): Promise<string> {
+  if (!CJK.test(text)) return text
+  try {
+    const c = await getConfig($)
+    const blocks: string[] = []
+    const r = await translate($, c.model, TO_EN + (await glossary($)), ASK_EN, mask(text, blocks, true))
+    await addSpent($, r.cost)
+    return r.ok ? unmask(r.text, blocks).trim() : text
+  } catch {
+    return text
+  }
+}
+
+// 第 i 题选项的对照：显示的（中文或英文）标签 → 另一边的标签
+function labelMap(from: AskQuestion | undefined, to: AskQuestion | undefined, also?: AskQuestion): Map<string, string> {
+  const m = new Map<string, string>()
+  also?.options?.forEach((o, j) => m.set(o.label, to?.options?.[j]?.label ?? o.label))
+  from?.options?.forEach((o, j) => m.set(o.label, to?.options?.[j]?.label ?? o.label))
+  return m
+}
+
+// 拆开一条回答（多选用逗号隔开）：在对照表里的是选的选项，换成对照的标签；其余是自己打的字
+function splitAnswer(answer: string, labels: Map<string, string>): { picked: string[]; typed: string } {
+  const parts = answer.split(', ')
+  return {
+    picked: parts.filter(p => labels.has(p)).map(p => labels.get(p)!),
+    typed: parts.filter(p => !labels.has(p)).join(', '),
+  }
+}
+
+// 问答框的回答换成英文给 Claude：选的中文选项换回原来的英文选项，自己打的中文译成英文
+async function askAnswerEn($: any, en: AskQuestion[], shown: AskQuestion[], r: AskAnswer): Promise<AskAnswer> {
+  const at = (k: string) => en.findIndex((q, i) => q.question === k || shown[i]?.question === k)
+  const answers: Record<string, string> = {}
+  for (const [k, a] of Object.entries(r.answers ?? {})) {
+    const i = at(k)
+    // 选的选项换回原来的英文，一个字不差；自己打的字（多选时排在选项后面）译成英文
+    const { picked, typed } = splitAnswer(String(a), labelMap(shown[i], en[i], en[i]))
+    answers[en[i]?.question ?? k] = [...picked, ...(typed ? [await answerEn($, typed)] : [])].join(', ')
+  }
+  const annotations: Record<string, { notes?: string; preview?: string }> = {}
+  for (const [k, n] of Object.entries(r.annotations ?? {})) {
+    annotations[en[at(k)]?.question ?? k] = n.notes ? { ...n, notes: await answerEn($, n.notes) } : n
+  }
+  return {
+    ...r,
+    questions: en,
+    answers,
+    ...(r.annotations ? { annotations } : {}),
+    ...(r.response ? { response: await answerEn($, r.response) } : {}),
+  }
+}
+
+// 回答那一行给你看的版本：问题和选项用你看到的中文，自己打的字照你打的
+function askAnswerShown(en: AskQuestion[], shown: AskQuestion[], r: AskAnswer): AskAnswer {
+  const at = (k: string) => en.findIndex((q, i) => q.question === k || shown[i]?.question === k)
+  const answers: Record<string, string> = {}
+  for (const [k, a] of Object.entries(r.answers ?? {})) {
+    const i = at(k)
+    const { picked, typed } = splitAnswer(String(a), labelMap(en[i], shown[i], shown[i]))
+    answers[shown[i]?.question ?? k] = [...picked, ...(typed ? [typed] : [])].join(', ')
+  }
+  const annotations: Record<string, { notes?: string; preview?: string }> = {}
+  for (const [k, n] of Object.entries(r.annotations ?? {})) annotations[shown[at(k)]?.question ?? k] = n
+  return { ...r, questions: shown, answers, ...(r.annotations ? { annotations } : {}) }
 }
 
 // 打开一个菜单面板；没有界面可画（比如 claude -p）时返回 false，命令改成只回文字
@@ -473,6 +611,7 @@ export const register: Register = on => {
     }
     const texts = content.filter(b => b.type === 'text' && b.text?.trim()).map(b => b.text as string)
     if (c.scope === 'final') await update($, turnAtom, t => ({ ...t, finalTexts: [...t.finalTexts, ...texts] }))
+    // 思考块不翻：屏幕上的思考摘要看着像普通文字，但引擎直接画它，没有绘制钩子，翻了也换不上去
     else for (const t of texts) void translateReply($, t) // 不等它：回复照常存下、照常显示，译好再换
     return next(e)
   })
@@ -489,6 +628,42 @@ export const register: Register = on => {
       await Promise.all(texts.map(t => translateReply($, t)))
     }
     return done
+  })
+
+  // ---------- 问答框（AskUserQuestion） ----------
+  // 先等译文（最多 ASK_WAIT_MS）：译好了问答框直接以中文弹出；更慢就先弹英文，译好再换。
+  // 你答完后，回答以英文交给 Claude
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    if (e.agentId !== undefined || e.tool !== 'AskUserQuestion') return next(e)
+    const c = await getConfig($)
+    if (!c.enabled || !(await read($, turnAtom)).zh) return next(e)
+    const en = e.questions as unknown as AskQuestion[]
+    const zhJob = translateAsk($, en)
+    const early = await Promise.race([zhJob, $.clock.sleep(ASK_WAIT_MS).then(() => undefined, () => undefined)])
+    const done = await next(early ? { ...e, questions: early as any } : e)
+    if (done.deny !== undefined || done.isError) return done
+    const shown = (await zhJob) ?? en
+    const r = done.result as unknown as AskAnswer
+    const enAnswer = await askAnswerEn($, en, shown, r)
+    await update($, answeredAtom, m => ({ ...m, [e.tool_use_id]: askAnswerShown(en, shown, r) }))
+    await saveState($)
+    return { result: enAnswer as any, ...(done.context ? { context: done.context } : {}) }
+  })
+
+  on('ui.render', { component: 'AskUserQuestion' }, async ($, e, next) => {
+    const c = await read($, configAtom)
+    const zh = (await read($, asksAtom))[askKey(e.props.questions as AskQuestion[])]
+    if (!c.enabled || !zh) return next(e)
+    return next({ ...e, props: { ...e.props, questions: zh } })
+  })
+
+  // 问答框的回答那一行：显示你看到的中文版
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
+    if (e.props.tool !== 'AskUserQuestion') return next(e)
+    const c = await read($, configAtom)
+    const shown = (await read($, answeredAtom))[e.props.tool_use_id]
+    if (!c.enabled || !shown) return next(e)
+    return next({ ...e, props: { ...e.props, output: shown } })
   })
 
   // ---------- 显示 ----------

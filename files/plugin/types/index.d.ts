@@ -23,6 +23,25 @@ export type Translation = {
   cost: number
 }
 
+/** 问答框（AskUserQuestion）里的一个问题：插件会翻译的字段，其余字段原样带着 */
+export type AskQuestion = {
+  question: string
+  header: string
+  description?: string
+  placeholder?: string
+  options?: { label: string; description?: string; preview?: string }[]
+  [field: string]: unknown
+}
+
+/** 问答框的回答（AskUserQuestion 的结果）：问题文本 → 选的选项（多选用逗号隔开）或自己打的字 */
+export type AskAnswer = {
+  questions: AskQuestion[]
+  answers: Record<string, string>
+  response?: string
+  annotations?: Record<string, { notes?: string; preview?: string }>
+  [field: string]: unknown
+}
+
 /** 这一轮：你发的是不是中文、原文是什么、最后一次调用工具之后的回复文本 */
 export type Turn = { zh: boolean; prompt: string; finalTexts: string[] }
 
@@ -35,6 +54,10 @@ declare module 'claude-code' {
       /** 回复的英文 → 翻译 */
       replies: Record<string, Translation>
       turn: Turn
+      /** 问答框：问题文本（每题一行）→ 中文版的问题 */
+      asks: Record<string, AskQuestion[]>
+      /** 问答框的回答那一行：这次调用的 id → 你看到的中文版回答 */
+      answered: Record<string, AskAnswer>
       /** 本会话翻译累计（美元） */
       spent: number
     }

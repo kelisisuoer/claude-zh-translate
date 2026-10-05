@@ -13,10 +13,11 @@ const CONFIG = norm(`${HOME}/.claude/zh-translate/config.json`)
 const mtimes: Record<string, number> = {}
 let tick = 1
 
-type Fakes = { failModel?: boolean | 'empty' | 'throw'; systems?: string[]; noPane?: boolean }
+type Fakes = { failModel?: boolean | 'empty' | 'throw'; badDialog?: boolean; slowDialog?: number; systems?: string[]; noPane?: boolean }
 
 // 引擎的服务调用（文件、进程、模型……）在测试里回答成 { value }；同一事件一个测试只能挂一次
 function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = {}) {
+  const clock = mock.clock(on)
   on('process.run', () => ({ value: { exitCode: 0, stdout: JSON.stringify({ home: HOME, tmp: TMP }), stderr: '', isStdoutTruncated: false } }))
   on('fs.read', ($: any, e: any) => {
     const p = norm(e.path)
@@ -45,7 +46,7 @@ function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = 
     seen.closed.push(e.id)
     return { value: undefined }
   })
-  on('model.complete', ($: any, e: any) => {
+  on('model.complete', async ($: any, e: any) => {
     seen.asks.push(e.prompt)
     opts.systems?.push(e.system)
     const usage0 = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
@@ -53,6 +54,13 @@ function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = 
     if (opts.failModel === 'empty') return { value: { isAnswered: false, reason: 'empty-reply', usage: usage0 } }
     if (opts.failModel) return { value: { isAnswered: false, reason: 'api-error', status: 529, usage: usage0 } }
     const body = /<text>\n([\s\S]*)\n<\/text>/.exec(e.prompt)?.[1] ?? ''
+    // 问答框：JSON 里每个值加“中”
+    if (e.prompt.startsWith('The JSON object')) {
+      if (opts.slowDialog) await clock.sleep(opts.slowDialog)
+      const o = JSON.parse(body) as Record<string, string>
+      const text = opts.badDialog ? '好的，这是翻译：' : JSON.stringify(Object.fromEntries(Object.entries(o).map(([k, v]) => [k, '中' + v])))
+      return { value: { isAnswered: true, text, usage: { input_tokens: 500, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+    }
     const toEn = e.prompt.startsWith('Translate the Chinese')
     return {
       value: {
@@ -72,6 +80,8 @@ function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = 
   // 引擎自己画消息的地方：把最后拿到的 props.text 画成一个 Text
   on('ui.render', { component: 'AssistantMessage' }, ($: any, e: any) => ({ type: 'Text', props: {}, children: [e.props.text] }))
   on('ui.render', { component: 'UserMessage' }, ($: any, e: any) => ({ type: 'Text', props: {}, children: [e.props.text] }))
+  on('ui.render', { component: 'ToolResult' }, ($: any, e: any) => ({ type: 'Text', props: {}, children: [JSON.stringify(e.props.output)] }))
+  return clock
 }
 
 const textOf = (tree: unknown) => JSON.stringify(tree)
@@ -419,9 +429,8 @@ test('/zh 和 /zh-model 注册成 immediate：Claude 回复中途输入也立刻
 test('别的窗口改了设置：2 秒内这个窗口跟着变，已经显示的回复重画', async ($: any, on: any) => {
   const files: Record<string, string> = {}
   const seen: Seen = { asks: [], closed: [], toasts: [] }
-  const clock = mock.clock(on)
   on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
-  fake(on, files, seen)
+  const clock = fake(on, files, seen)
   try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
 
   await $.prompt.submit({ text: '帮我看看日志', wait: false, origin: { kind: 'composer' } })
@@ -531,4 +540,176 @@ test('翻译请求没发出去（引擎拒绝）：显示没有翻译的原因�
   expect(shown.includes('这一段没有翻译')).toBe(true)
   expect(shown.includes('翻译请求没有发出去')).toBe(true)
   expect(shown.includes('翻译中')).toBe(false)
+})
+
+// ---------- 第七轮：问答框（AskUserQuestion） ----------
+
+const QUESTIONS = [
+  { question: 'Which approach?', header: 'Approach', multiSelect: false, options: [{ label: 'Retry', description: 'Try the call again' }, { label: 'Skip' }] },
+  { question: 'Which checks?', header: 'Checks', multiSelect: true, options: [{ label: 'Lint' }, { label: 'Tests' }, { label: 'Types' }] },
+]
+
+// 引擎这边的问答框：问答框只能由引擎自己画（插件只能改它拿到的问题），这里记下引擎拿到的问题；
+// 弹出后等中文出现（waitFor），然后按 answer 回答
+function dialog(on: any, $: any, seen: { drawn: string; id: string; input?: string }, answer: (e: any) => any, waitFor = '') {
+  on('ui.render', { component: 'AskUserQuestion' }, (_: any, e: any) => {
+    seen.drawn = JSON.stringify(e.props.questions)
+    return { type: 'engine', ref: 1 }
+  })
+  on('tool.call', async (_: any, e: any) => {
+    seen.id = e.tool_use_id
+    seen.input = JSON.stringify(e.questions)
+    const box = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'AskUserQuestion', props: { tool: 'AskUserQuestion', questions: e.questions } })
+    for (let i = 0; i < 200 && waitFor && !seen.drawn.includes(waitFor); i++) await box.drawn()
+    return { result: answer(e) }
+  })
+}
+
+test('问答框：问题和选项显示成中文；选的中文选项换回英文、自己打的中文译成英文再交给 Claude；回答那一行显示中文', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+  const box = { drawn: '', id: '' }
+  dialog(on, $, box, () => ({
+    questions: QUESTIONS,
+    answers: { '中Which approach?': '中Retry', '中Which checks?': '顺便看看日志' },
+    annotations: { '中Which approach?': { notes: '先别动数据库' } },
+  }), '中Which approach?')
+
+  await $.prompt.submit({ text: '帮我选个方案', wait: false, origin: { kind: 'composer' } })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
+
+  // 译文 6 秒内就到：问答框直接以中文弹出
+  expect(String((box as any).input).includes('中Which approach?')).toBe(true)
+  expect(box.drawn.includes('中Which approach?')).toBe(true)
+  expect(box.drawn.includes('中Retry')).toBe(true)
+  expect(box.drawn.includes('中Try the call again')).toBe(true)
+  expect(box.drawn.includes('中Approach')).toBe(true)
+  expect(r.result.answers).toEqual({ 'Which approach?': 'Retry', 'Which checks?': 'EN: 顺便看看日志' })
+  expect(r.result.annotations).toEqual({ 'Which approach?': { notes: 'EN: 先别动数据库' } })
+  expect(r.result.questions[0].question).toBe('Which approach?')
+
+  const row = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'ToolResult', props: { tool_use_id: box.id, tool: 'AskUserQuestion', output: r.result, isErrored: false } })
+  const shown = textOf(await row.drawn())
+  expect(shown.includes('中Which approach?')).toBe(true)
+  expect(shown.includes('中Retry')).toBe(true)
+  expect(shown.includes('顺便看看日志')).toBe(true)
+  expect(shown.includes('先别动数据库')).toBe(true)
+  expect(shown.includes('EN: ')).toBe(false)
+})
+
+test('问答框多选：选的几个中文选项都换回英文；自己打的回答（response）译成英文', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+  const box = { drawn: '', id: '' }
+  dialog(on, $, box, () => ({
+    questions: QUESTIONS,
+    answers: { '中Which checks?': '中Lint, 中Types' },
+    response: '其实两个都要',
+  }), '中Which checks?')
+
+  await $.prompt.submit({ text: '帮我选个方案', wait: false, origin: { kind: 'composer' } })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
+  expect(r.result.answers).toEqual({ 'Which checks?': 'Lint, Types' })
+  expect(r.result.response).toBe('EN: 其实两个都要')
+})
+
+test('英文对话里的问答框：不翻译，回答原样交给 Claude', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+  const box = { drawn: '', id: '' }
+  dialog(on, $, box, () => ({ questions: QUESTIONS, answers: { 'Which approach?': 'Retry' } }))
+
+  await $.prompt.submit({ text: 'pick an approach', wait: false, origin: { kind: 'composer' } })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
+  expect(box.drawn.includes('中')).toBe(false)
+  expect(r.result.answers).toEqual({ 'Which approach?': 'Retry' })
+  expect(seen.asks.length).toBe(0)
+})
+
+test('中文还没出来就答了：选的英文选项照原样，自己打的中文照样译成英文', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+  const box = { drawn: '', id: '' }
+  dialog(on, $, box, () => ({ questions: QUESTIONS, answers: { 'Which approach?': 'Skip', 'Which checks?': '都不用' } }))
+
+  await $.prompt.submit({ text: '帮我选个方案', wait: false, origin: { kind: 'composer' } })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
+  expect(r.result.answers).toEqual({ 'Which approach?': 'Skip', 'Which checks?': 'EN: 都不用' })
+})
+
+test('问答框没译成（翻译模型给的不是 JSON）：照常显示英文，自己打的中文照样译成英文', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { badDialog: true })
+  const box = { drawn: '', id: '' }
+  dialog(on, $, box, () => ({ questions: QUESTIONS, answers: { 'Which approach?': 'Retry', 'Which checks?': '看情况' } }))
+
+  await $.prompt.submit({ text: '帮我选个方案', wait: false, origin: { kind: 'composer' } })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
+  expect(r.result.answers).toEqual({ 'Which approach?': 'Retry', 'Which checks?': 'EN: 看情况' })
+  const row = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'ToolResult', props: { tool_use_id: box.id, tool: 'AskUserQuestion', output: r.result, isErrored: false } })
+  const shown = textOf(await row.drawn())
+  expect(shown.includes('Which approach?')).toBe(true)
+  expect(shown.includes('看情况')).toBe(true)
+})
+
+test('问答框的译文太慢（超过 6 秒）：先以英文弹出，译好再换成中文；回答照样换回英文', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const clock = fake(on, files, seen, { slowDialog: 10000 })
+  let opened = ''
+  let drawn = ''
+  on('ui.render', { component: 'AskUserQuestion' }, (_: any, e: any) => {
+    drawn = JSON.stringify(e.props.questions)
+    return { type: 'engine', ref: 1 }
+  })
+  on('tool.call', async (_: any, e: any) => {
+    opened = JSON.stringify(e.questions)
+    const box = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'AskUserQuestion', props: { tool: 'AskUserQuestion', questions: e.questions } })
+    for (let i = 0; i < 30 && !drawn.includes('中Which approach?'); i++) {
+      await box.drawn()
+      await clock.sleep(1000)
+    }
+    return { result: { questions: e.questions, answers: { '中Which approach?': '中Skip' } } }
+  })
+
+  await $.prompt.submit({ text: '帮我选个方案', wait: false, origin: { kind: 'composer' } })
+  const call = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
+  await clock.advance(6000)
+  expect(opened.includes('Which approach?')).toBe(true)
+  expect(opened.includes('中')).toBe(false)
+  await clock.advance(6000)
+  const r = await call
+  expect(drawn.includes('中Which approach?')).toBe(true)
+  expect(r.result.answers).toEqual({ 'Which approach?': 'Skip' })
+})
+
+test('思考块不翻：引擎直接画屏幕上的思考摘要，插件换不上去，翻了白花钱', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+
+  await $.prompt.submit({ text: '帮我看看', wait: false, origin: { kind: 'composer' } })
+  const asked = seen.asks.length
+  await append($, { type: 'assistant', role: 'assistant', content: [{ type: 'thinking', thinking: 'Checking the log first.', signature: 'sig' }] }, 'th1')
+  expect(seen.asks.length).toBe(asked)
+})
+
+test('问答框多选又自己打了字：选的选项一字不差地换回英文，只把自己打的字译成英文', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+  const box = { drawn: '', id: '' }
+  dialog(on, $, box, () => ({ questions: QUESTIONS, answers: { '中Which checks?': '中Lint, 中Types, 顺便跑一下性能测试' } }), '中Which checks?')
+
+  await $.prompt.submit({ text: '帮我选个方案', wait: false, origin: { kind: 'composer' } })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
+  expect(r.result.answers).toEqual({ 'Which checks?': 'Lint, Types, EN: 顺便跑一下性能测试' })
+
+  const row = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'ToolResult', props: { tool_use_id: box.id, tool: 'AskUserQuestion', output: r.result, isErrored: false } })
+  expect(textOf(await row.drawn()).includes('中Lint, 中Types, 顺便跑一下性能测试')).toBe(true)
 })

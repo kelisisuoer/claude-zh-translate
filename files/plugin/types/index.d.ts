@@ -16,6 +16,8 @@ export type Config = {
 export type Translation = {
   zh?: string
   pending?: boolean
+  /** 正在译它的那一份插件（每次载入一个标记）。插件重载后对不上，说明原来那次翻译已经随重载没了 */
+  owner?: string
   error?: string
   /** 美元，按 API 价格估算 */
   cost: number

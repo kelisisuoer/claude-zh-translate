@@ -75,6 +75,10 @@ const REPLY_EN = 'Write your reply in English even though the user wrote in Chin
 type Paths = { home: string; tmp: string }
 let paths: Paths | null = null
 let configLoaded = false
+// 这一份插件的标记：每次载入（包括重载）都不一样
+const LOAD = Math.random().toString(36).slice(2)
+// 设置文件上次读到时的修改时间：别的窗口改了设置，这里靠它发现
+let configSeen = -1
 // 是不是交互界面（claude -p 这类没有界面，打不开菜单）
 let interactive = true
 
@@ -175,13 +179,34 @@ async function stateFile($: any): Promise<string> {
   return `${(await where($)).tmp}/claude-zh/plugin-state-${safe(await $.session.id())}.json`
 }
 
+async function configMtime($: any): Promise<number> {
+  try { return (await $.fs.stat(await configFile($))).mtimeMs } catch { return -1 }
+}
+
+// 设置文件里存的设置；还没有设置文件时为 null
+async function readSaved($: any): Promise<Config | null> {
+  try {
+    const saved: Partial<Config> = JSON.parse(await readText($, await configFile($)))
+    return { ...DEFAULT_CONFIG, ...saved, model: saved.model || DEFAULT_CONFIG.model }
+  } catch { return null }
+}
+
+const sameConfig = (a: Config, b: Config) =>
+  Object.keys({ ...a, ...b }).every(k => (a as any)[k] === (b as any)[k])
+
 async function loadConfig($: any): Promise<Config> {
-  let saved: Partial<Config> = {}
-  try { saved = JSON.parse(await readText($, await configFile($))) } catch {}
-  const c: Config = { ...DEFAULT_CONFIG, ...saved, model: saved.model || DEFAULT_CONFIG.model }
-  await update($, configAtom, () => c)
+  configSeen = await configMtime($)
+  const c = (await readSaved($)) ?? { ...DEFAULT_CONFIG }
+  // 没变就不动，免得屏幕上的回复白白重画
+  if (!configLoaded || !sameConfig(await read($, configAtom), c)) await update($, configAtom, () => c)
   configLoaded = true
   return c
+}
+
+// 设置对所有窗口生效：设置文件被别的窗口改过（修改时间变了）就重新读
+async function syncConfig($: any): Promise<void> {
+  if (configLoaded && (await configMtime($)) === configSeen) return
+  await loadConfig($)
 }
 
 async function getConfig($: any): Promise<Config> {
@@ -189,8 +214,12 @@ async function getConfig($: any): Promise<Config> {
 }
 
 async function saveConfig($: any, change: Partial<Config>): Promise<Config> {
-  const c = await update($, configAtom, old => ({ ...old, ...change }))
+  // 在设置文件现有的内容上改，不用本窗口记着的旧设置，免得把别的窗口刚改的设置盖回去
+  const base = (await readSaved($)) ?? (await getConfig($))
+  const c = { ...base, ...change }
+  await update($, configAtom, () => c)
   await $.fs.write(await configFile($), JSON.stringify(c, null, 2))
+  configSeen = await configMtime($)
   return c
 }
 
@@ -221,6 +250,14 @@ async function glossary($: any): Promise<string> {
 // ---------- 翻译 ----------
 type Done = { ok: true; text: string; cost: number } | { ok: false; reason: string; cost: number }
 
+// 翻译模型没给出译文的原因，说成能看懂的话
+function whyFailed(r: { reason: string; status?: number }): string {
+  if (r.reason === 'empty-reply') return '翻译模型没有给出译文，可能是这段内容没通过它的安全检查'
+  if (r.reason === 'aborted') return '翻译超时'
+  if (r.reason === 'api-error') return `翻译接口出错${r.status ? `（${r.status}）` : ''}，可能是网络或服务暂时有问题`
+  return r.reason
+}
+
 async function translate($: any, model: string, system: string, ask: string, text: string, context = ''): Promise<Done> {
   const r = await $.model.complete({
     model,
@@ -231,7 +268,7 @@ async function translate($: any, model: string, system: string, ask: string, tex
     timeoutMs: 180000,
   })
   const cost = costOf(model, r.usage ?? { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
-  if (!r.isAnswered) return { ok: false, reason: r.reason === 'api-error' ? `接口错误 ${r.status ?? ''}`.trim() : r.reason, cost }
+  if (!r.isAnswered) return { ok: false, reason: whyFailed(r), cost }
   return { ok: true, text: r.text.replace(/^\s*<text>\s*|\s*<\/text>\s*$/g, '').trim(), cost }
 }
 
@@ -244,11 +281,18 @@ async function translateReply($: any, en: string): Promise<void> {
   const key = en.trim()
   if (!key || !needsZh(key)) return
   const known = (await read($, repliesAtom))[key]
-  if (known && (known.zh || known.pending)) return
-  await update($, repliesAtom, m => ({ ...m, [key]: { pending: true, cost: 0 } }))
-  const c = await getConfig($)
+  // 正在译的不重复译；标着“翻译中”但不是这一份插件在译的（重载前开始的），那次翻译已经没了，重新译
+  if (known && (known.zh || (known.pending && known.owner === LOAD))) return
+  await update($, repliesAtom, m => ({ ...m, [key]: { pending: true, owner: LOAD, cost: 0 } }))
   const blocks: string[] = []
-  const r = await translate($, c.model, TO_ZH + (await glossary($)), ASK_ZH, mask(key, blocks, false), (await read($, turnAtom)).prompt)
+  let r: Done
+  try {
+    const c = await getConfig($)
+    r = await translate($, c.model, TO_ZH + (await glossary($)), ASK_ZH, mask(key, blocks, false), (await read($, turnAtom)).prompt)
+  } catch (err) {
+    // 请求没发出去（比如引擎拒绝）：记成没翻译，别一直显示“翻译中”
+    r = { ok: false, reason: `翻译请求没有发出去（${String((err as any)?.message ?? err).slice(0, 80)}）`, cost: 0 }
+  }
   await addSpent($, r.cost)
   const entry: Translation = r.ok ? { zh: unmask(r.text, blocks), cost: r.cost } : { error: r.reason, cost: r.cost }
   await update($, repliesAtom, m => ({ ...m, [key]: entry }))
@@ -280,14 +324,20 @@ export const register: Register = on => {
     interactive = e.isInteractive !== false
     await loadConfig($)
     await loadState($)
-    await $.command.register({ name: 'zh', description: '中文翻译设置菜单（也可以直接 /zh on | off | only | both | all | final）' })
-    await $.command.register({ name: 'zh-model', description: '选择中文翻译用的模型（上下键选择）' })
+    // 插件重载时没译完的回复（标着“翻译中”，但不是这一份插件在译）：重新译，不然会一直显示“翻译中”
+    for (const [k, v] of Object.entries(await read($, repliesAtom))) if (v.pending && v.owner !== LOAD) void translateReply($, k)
+    // 每 2 秒看一眼设置文件，别的窗口改了设置这里跟着变；看一眼只读文件的修改时间
+    $.clock.every(2000, () => { void syncConfig($).catch(() => {}) })
+    // immediate：Claude 正在回复时打 /zh 也立刻弹出菜单，和 /model 一样，不用等这一轮结束
+    await $.command.register({ name: 'zh', description: '中文翻译设置菜单（也可以直接 /zh on | off | only | both | all | final）', immediate: true })
+    await $.command.register({ name: 'zh-model', description: '选择中文翻译用的模型（上下键选择）', immediate: true })
     return next(e)
   })
 
   // ---------- 命令 ----------
   on('command.run', { command: 'zh' }, async ($, e) => {
     const a = e.args.trim().toLowerCase()
+    await syncConfig($)
     let c = await getConfig($)
     let note = ''
     if (!a) {
@@ -305,6 +355,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'zh-model' }, async $ => {
+    await syncConfig($)
     const opened = await openPane($, PANE, '翻译模型', MODELS.length + 3)
     return { text: opened ? '用上下键或 Tab 选择翻译模型，回车确认，Esc 取消。' : '这里打不开选择列表，请用 /zh model <模型 ID> 切换。' }
   })
@@ -388,6 +439,7 @@ export const register: Register = on => {
     if (e.origin.kind !== 'composer' && e.origin.kind !== 'sdk') return next(e)
     const text = e.text.trim()
     if (text.startsWith('/')) return next(e)
+    await syncConfig($)
     const c = await getConfig($)
     if (!c.enabled || !CJK.test(text)) {
       await update($, turnAtom, () => ({ zh: false, prompt: '', finalTexts: [] }))
@@ -398,7 +450,7 @@ export const register: Register = on => {
     const r = await translate($, c.model, TO_EN + (await glossary($)), ASK_EN, mask(text, blocks, true))
     await addSpent($, r.cost)
     if (!r.ok) {
-      $.ui.toast(`翻译失败，这条按中文原文发送（${r.reason}）`)
+      $.ui.toast(`这条没有翻译，按中文原文发送：${r.reason}`)
       return next({ ...e, context: [...(e.context ?? []), REPLY_EN] })
     }
     const en = unmask(r.text, blocks).trim()
@@ -454,7 +506,7 @@ export const register: Register = on => {
     const tr = (await read($, repliesAtom))[e.props.text.trim()]
     if (!c.enabled || !tr) return next(e)
     if (tr.pending) return next({ ...e, props: { ...e.props, text: `${e.props.text}\n\n*（翻译中…）*` } })
-    if (!tr.zh) return next({ ...e, props: { ...e.props, text: `${e.props.text}\n\n*（中文翻译失败：${tr.error}）*` } })
+    if (!tr.zh) return next({ ...e, props: { ...e.props, text: `${e.props.text}\n\n*（这一段没有翻译，上面是英文原文。原因：${tr.error}）*` } })
     // 关了“显示翻译费用”就不写金额；both 模式的分隔线照留
     const cost = c.showCost ? `本条 ${usd(tr.cost)} · 本会话翻译累计 ${usd(await read($, spentAtom))}` : ''
     const text = c.mode === 'both'

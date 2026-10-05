@@ -64,7 +64,7 @@ Just ask in Chinese. Use `/zh` for settings:
 
 Notes:
 
-- **Changes apply at once.** For example, switching from `only` to `both` redraws the replies already on screen.
+- **Changes apply at once.** For example, switching from `only` to `both` redraws the replies already on screen. Settings apply to every window: a change made in one window reaches the other open windows within 2 seconds. The menu also opens while Claude is replying.
 - **No cost for commands.** The plugin handles these commands itself; they're never sent to Claude.
 - **Translations in progress.** A reply still being translated shows in English with a "翻译中…" (translating) note, then switches to Chinese.
 
@@ -101,6 +101,7 @@ The `/zh-model` list shows an estimated price per reply block for each version. 
 
 ## Changelog
 
+- **0.3.1**: `/zh` and `/zh-model` open right away even while Claude is replying, instead of waiting for the turn to end. Settings now apply to every open window (before, turning off the cost display in one window left the others unchanged). When a translation fails, the note explains why in plain words instead of a bare code like `empty-reply`. Fixed replies stuck on "翻译中…" (translating): a reply still being translated when the plugin reloaded (for example during an upgrade) used to stay stuck; it is now translated again.
 - **0.3.0**: Choose whether translation costs are shown (the "显示翻译费用" group in the `/zh` menu, or `/zh cost on` / `/zh cost off`).
 - **0.2.0**: Rebuilt as a Claude Code plugin. Your Chinese reaches Claude only as English, replies are shown in Chinese in place, and there's a `/zh` settings menu and a `/zh-model` model list.
 

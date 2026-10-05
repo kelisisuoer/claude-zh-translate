@@ -1,5 +1,5 @@
 // zh-translate 的测试：引擎下面的文件、进程、模型调用都换成假的，翻译结果加前缀，好断言
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 type Seen = { submitted?: { text: string; context?: readonly string[] }; asks: string[]; closed: string[]; toasts: string[]; opened?: string[] }
 
@@ -9,7 +9,11 @@ const TMP = '/t'
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
 const CONFIG = norm(`${HOME}/.claude/zh-translate/config.json`)
 
-type Fakes = { failModel?: boolean; systems?: string[]; noPane?: boolean }
+// 假文件的修改时间：写一次加一，没写过的算 1
+const mtimes: Record<string, number> = {}
+let tick = 1
+
+type Fakes = { failModel?: boolean | 'empty' | 'throw'; systems?: string[]; noPane?: boolean }
 
 // 引擎的服务调用（文件、进程、模型……）在测试里回答成 { value }；同一事件一个测试只能挂一次
 function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = {}) {
@@ -20,7 +24,12 @@ function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = 
   })
   on('fs.write', ($: any, e: any) => {
     files[norm(e.path)] = e.text
+    mtimes[norm(e.path)] = ++tick
     return { value: undefined }
+  })
+  on('fs.stat', ($: any, e: any) => {
+    const p = norm(e.path)
+    return p in files ? { value: { kind: 'file', size: files[p]!.length, mtimeMs: mtimes[p] ?? 1, isLink: false } } : { deny: `ENOENT ${p}` }
   })
   on('session.id', () => ({ value: 'sess-1' }))
   on('ui.toast', ($: any, e: any) => {
@@ -40,6 +49,8 @@ function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = 
     seen.asks.push(e.prompt)
     opts.systems?.push(e.system)
     const usage0 = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    if (opts.failModel === 'throw') return { deny: 'model blocked' }
+    if (opts.failModel === 'empty') return { value: { isAnswered: false, reason: 'empty-reply', usage: usage0 } }
     if (opts.failModel) return { value: { isAnswered: false, reason: 'api-error', status: 529, usage: usage0 } }
     const body = /<text>\n([\s\S]*)\n<\/text>/.exec(e.prompt)?.[1] ?? ''
     const toEn = e.prompt.startsWith('Translate the Chinese')
@@ -202,13 +213,14 @@ test('翻译失败：中文原样发出并提示；回复显示失败说明，�
   await $.prompt.submit({ text: '帮我看看', wait: false, origin: { kind: 'composer' } })
   expect(seen.submitted?.text).toBe('帮我看看')
   expect(seen.submitted?.context?.some(c => c.startsWith('Write your reply in English'))).toBe(true)
-  expect(seen.toasts.some(t => t.includes('翻译失败'))).toBe(true)
+  expect(seen.toasts.some(t => t.includes('这条没有翻译') && t.includes('翻译接口出错（529）'))).toBe(true)
 
   await reply($, 'Here is the answer.', 'f1')
   const m = await mountReply($, 'Here is the answer.')
-  const shown = await drawnUntil(m, '中文翻译失败')
+  const shown = await drawnUntil(m, '这一段没有翻译')
   expect(shown.includes('Here is the answer.')).toBe(true)
-  expect(shown.includes('中文翻译失败')).toBe(true)
+  expect(shown.includes('这一段没有翻译，上面是英文原文')).toBe(true)
+  expect(shown.includes('翻译接口出错（529）')).toBe(true)
 })
 
 test('/zh off：中文原样发送，回复不翻译', async ($: any, on: any) => {
@@ -373,4 +385,150 @@ test('关掉显示费用：回复、菜单、状态文字都不显示金额；bo
   expect(JSON.parse(files[CONFIG] ?? '{}').showCost).toBe(true)
   expect(textOf(await m.drawn()).includes('本条')).toBe(true)
   expect(textOf(await pane.drawn()).includes('本会话翻译累计')).toBe(true)
+})
+
+test('翻译模型没给译文（empty-reply）：说明可能是没通过安全检查，显示英文原文', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { failModel: 'empty' })
+
+  await $.prompt.submit({ text: '帮我看看', wait: false, origin: { kind: 'composer' } })
+  expect(seen.toasts.some(t => t.includes('安全检查'))).toBe(true)
+  await reply($, 'Here is the answer.', 'e1')
+  const m = await mountReply($, 'Here is the answer.')
+  const shown = await drawnUntil(m, '安全检查')
+  expect(shown.includes('Here is the answer.')).toBe(true)
+  expect(shown.includes('翻译模型没有给出译文，可能是这段内容没通过它的安全检查')).toBe(true)
+  expect(shown.includes('empty-reply')).toBe(false)
+})
+
+test('/zh 和 /zh-model 注册成 immediate：Claude 回复中途输入也立刻弹出，不用等这一轮结束', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const regs: any[] = []
+  on('command.register', ($: any, e: any) => { regs.push(e); return { value: { command: e.name } } })
+  fake(on, files, seen)
+
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+  expect(regs.map(r => r.name).sort()).toEqual(['zh', 'zh-model'])
+  expect(regs.every(r => r.immediate === true)).toBe(true)
+})
+
+// ---------- 第五轮：设置对所有窗口生效 ----------
+
+test('别的窗口改了设置：2 秒内这个窗口跟着变，已经显示的回复重画', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const clock = mock.clock(on)
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  fake(on, files, seen)
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+
+  await $.prompt.submit({ text: '帮我看看日志', wait: false, origin: { kind: 'composer' } })
+  const en = 'The log shows a timeout.'
+  await reply($, en, 'g1')
+  const m = await mountReply($, en)
+  expect((await drawnUntil(m, '翻译费用')).includes('翻译费用')).toBe(true)
+
+  // 另一个窗口用 /zh 关掉了费用显示：设置文件变了
+  files[CONFIG] = JSON.stringify({ ...JSON.parse(files[CONFIG] ?? '{}'), showCost: false })
+  mtimes[CONFIG] = ++tick
+  await clock.advance(1000)
+  expect(textOf(await m.drawn()).includes('翻译费用')).toBe(true)
+  await clock.advance(1000)
+  const after = textOf(await m.drawn())
+  expect(after.includes('中文：The log shows a timeout.')).toBe(true)
+  expect(after.includes('翻译费用')).toBe(false)
+
+  // 再打开：同样跟着变
+  files[CONFIG] = JSON.stringify({ ...JSON.parse(files[CONFIG]!), showCost: true })
+  mtimes[CONFIG] = ++tick
+  await clock.advance(2000)
+  expect(textOf(await m.drawn()).includes('翻译费用')).toBe(true)
+})
+
+test('在这个窗口的菜单里改设置，不会把别的窗口刚改的设置盖回去', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+
+  const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-settings', props: { title: '中文翻译设置' } })
+  await pane.press({ key: 'both' })
+  expect(JSON.parse(files[CONFIG]!).mode).toBe('both')
+
+  // 菜单还开着，另一个窗口关掉了费用显示、换了模型
+  files[CONFIG] = JSON.stringify({ ...JSON.parse(files[CONFIG]!), showCost: false, model: 'claude-haiku-4-5' })
+  mtimes[CONFIG] = ++tick
+  await pane.press({ key: 'final' })
+  const saved = JSON.parse(files[CONFIG]!)
+  expect(saved.mode).toBe('both')
+  expect(saved.scope).toBe('final')
+  expect(saved.showCost).toBe(false)
+  expect(saved.model).toBe('claude-haiku-4-5')
+  // 这个窗口的菜单也显示别的窗口改的结果
+  expect(String((await pane.find({ key: 'cost-off' }))?.props?.label).includes('●')).toBe(true)
+})
+
+// ---------- 第六轮：卡在“翻译中” ----------
+
+test('插件重载时没译完的回复：新载入的插件重新译，不会一直显示“翻译中”', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  // 模拟重载：先开始的那两次翻译属于重载前的那一份插件，它们的译文永远写不进来，只剩“翻译中”的标记
+  // （第一段的标记是重载前那份插件的，第二段是旧版本写的，没有 owner）
+  let reloaded = false
+  on('state.set', async ($: any, e: any, next: any) => {
+    if (e.key !== 'replies' || reloaded) return next(e)
+    const value = Object.fromEntries(Object.entries(e.value as Record<string, any>).map(([k, v]) =>
+      [k, k.includes('older') ? { pending: true, cost: 0 } : { pending: true, owner: 'old-load', cost: 0 }]))
+    return next({ ...e, value })
+  })
+  fake(on, files, seen)
+
+  await $.prompt.submit({ text: '帮我看看', wait: false, origin: { kind: 'composer' } })
+  await reply($, 'The answer was cut off.', 'k1')
+  await reply($, 'Written by an older version.', 'k2')
+  const m = await mountReply($, 'The answer was cut off.')
+  const m2 = await mountReply($, 'Written by an older version.')
+  expect(textOf(await m.drawn()).includes('翻译中')).toBe(true)
+  expect(textOf(await m2.drawn()).includes('翻译中')).toBe(true)
+
+  // 新载入的插件：session.start 把没译完的重新译
+  reloaded = true
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+  const shown = await drawnUntil(m, '中文：The answer was cut off.')
+  expect(shown.includes('中文：The answer was cut off.')).toBe(true)
+  expect(shown.includes('翻译中')).toBe(false)
+  const shown2 = await drawnUntil(m2, '中文：Written by an older version.')
+  expect(shown2.includes('中文：Written by an older version.')).toBe(true)
+  expect(shown2.includes('翻译中')).toBe(false)
+})
+
+test('正在译的回复不会被重复译', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+
+  await $.prompt.submit({ text: '帮我看看', wait: false, origin: { kind: 'composer' } })
+  const asked = seen.asks.length
+  await reply($, 'Same paragraph.', 'd1')
+  await reply($, 'Same paragraph.', 'd2')
+  const m = await mountReply($, 'Same paragraph.')
+  await drawnUntil(m, '中文：Same paragraph.')
+  expect(seen.asks.length - asked).toBe(1)
+})
+
+test('翻译请求没发出去（引擎拒绝）：显示没有翻译的原因，不会一直显示“翻译中”', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { failModel: 'throw' })
+
+  await $.prompt.submit({ text: '帮我看看', wait: false, origin: { kind: 'composer' } })
+  await reply($, 'Here is the answer.', 't1')
+  const m = await mountReply($, 'Here is the answer.')
+  const shown = await drawnUntil(m, '这一段没有翻译')
+  expect(shown.includes('这一段没有翻译')).toBe(true)
+  expect(shown.includes('翻译请求没有发出去')).toBe(true)
+  expect(shown.includes('翻译中')).toBe(false)
 })

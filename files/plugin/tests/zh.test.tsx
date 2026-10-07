@@ -13,7 +13,7 @@ const CONFIG = norm(`${HOME}/.claude/zh-translate/config.json`)
 const mtimes: Record<string, number> = {}
 let tick = 1
 
-type Fakes = { failModel?: boolean | 'empty' | 'throw'; badDialog?: boolean; slowDialog?: number; systems?: string[]; noPane?: boolean }
+type Fakes = { failModel?: boolean | 'empty' | 'throw'; badDialog?: boolean | string; slowDialog?: number; dialogTimeouts?: number[]; systems?: string[]; noPane?: boolean }
 
 // 引擎的服务调用（文件、进程、模型……）在测试里回答成 { value }；同一事件一个测试只能挂一次
 function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = {}) {
@@ -56,9 +56,11 @@ function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = 
     const body = /<text>\n([\s\S]*)\n<\/text>/.exec(e.prompt)?.[1] ?? ''
     // 问答框：JSON 里每个值加“中”
     if (e.prompt.startsWith('The JSON object')) {
+      opts.dialogTimeouts?.push(e.timeoutMs)
       if (opts.slowDialog) await clock.sleep(opts.slowDialog)
       const o = JSON.parse(body) as Record<string, string>
-      const text = opts.badDialog ? '好的，这是翻译：' : JSON.stringify(Object.fromEntries(Object.entries(o).map(([k, v]) => [k, '中' + v])))
+      const bad = opts.badDialog === true || (typeof opts.badDialog === 'string' && body.includes(opts.badDialog))
+      const text = bad ? '好的，这是翻译：' : JSON.stringify(Object.fromEntries(Object.entries(o).map(([k, v]) => [k, '中' + v])))
       return { value: { isAnswered: true, text, usage: { input_tokens: 500, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
     }
     const toEn = e.prompt.startsWith('Translate the Chinese')
@@ -74,8 +76,8 @@ function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = 
     seen.submitted = { text: e.text, context: e.context }
     return { text: e.text, context: e.context }
   })
-  // 测试里下面没有真的存储：存下即可（插件的钩子先跑完，这里收尾）
-  on('session.append', ($: any, e: any) => ({ message: e.message, uuid: e.uuid }))
+  // 存消息交给下面的引擎（Claude Code 2.1.292 起测试工具要求传下去，不能自己回答）
+  on('session.append', ($: any, e: any, next: any) => next(e))
   on('turn.complete', ($: any, e: any) => ({ text: e.answer }))
   // 引擎自己画消息的地方：把最后拿到的 props.text 画成一个 Text
   on('ui.render', { component: 'AssistantMessage' }, ($: any, e: any) => ({ type: 'Text', props: {}, children: [e.props.text] }))
@@ -629,7 +631,7 @@ test('英文对话里的问答框：不翻译，回答原样交给 Claude', asyn
   expect(seen.asks.length).toBe(0)
 })
 
-test('中文还没出来就答了：选的英文选项照原样，自己打的中文照样译成英文', async ($: any, on: any) => {
+test('回答里用的是英文问题和选项（问答框没换成中文时）：照原样，自己打的中文照样译成英文', async ($: any, on: any) => {
   const files: Record<string, string> = {}
   const seen: Seen = { asks: [], closed: [], toasts: [] }
   fake(on, files, seen)
@@ -657,35 +659,42 @@ test('问答框没译成（翻译模型给的不是 JSON）：照常显示英文
   expect(shown.includes('看情况')).toBe(true)
 })
 
-test('问答框的译文太慢（超过 6 秒）：先以英文弹出，译好再换成中文；回答照样换回英文', async ($: any, on: any) => {
+test('问答框译得慢（10 秒）：等译好再弹出，直接是中文；一题一个请求同时发，每个最多等 20 秒；等的时候提示正在翻译', async ($: any, on: any) => {
   const files: Record<string, string> = {}
   const seen: Seen = { asks: [], closed: [], toasts: [] }
-  const clock = fake(on, files, seen, { slowDialog: 10000 })
+  const timeouts: number[] = []
+  const clock = fake(on, files, seen, { slowDialog: 10000, dialogTimeouts: timeouts })
   let opened = ''
-  let drawn = ''
-  on('ui.render', { component: 'AskUserQuestion' }, (_: any, e: any) => {
-    drawn = JSON.stringify(e.props.questions)
-    return { type: 'engine', ref: 1 }
-  })
   on('tool.call', async (_: any, e: any) => {
     opened = JSON.stringify(e.questions)
-    const box = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'AskUserQuestion', props: { tool: 'AskUserQuestion', questions: e.questions } })
-    for (let i = 0; i < 30 && !drawn.includes('中Which approach?'); i++) {
-      await box.drawn()
-      await clock.sleep(1000)
-    }
     return { result: { questions: e.questions, answers: { '中Which approach?': '中Skip' } } }
   })
 
   await $.prompt.submit({ text: '帮我选个方案', wait: false, origin: { kind: 'composer' } })
   const call = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
-  await clock.advance(6000)
-  expect(opened.includes('Which approach?')).toBe(true)
-  expect(opened.includes('中')).toBe(false)
-  await clock.advance(6000)
+  await clock.advance(9000)
+  expect(opened).toBe('')
+  expect(seen.toasts.some(t => t.includes('正在把问答框译成中文'))).toBe(true)
+  await clock.advance(2000)
   const r = await call
-  expect(drawn.includes('中Which approach?')).toBe(true)
+  expect(opened.includes('中Which approach?')).toBe(true)
+  expect(opened.includes('中Which checks?')).toBe(true)
+  expect(timeouts).toEqual([20000, 20000])
   expect(r.result.answers).toEqual({ 'Which approach?': 'Skip' })
+})
+
+test('问答框里一题没译成：那一题显示英文，其他题照样中文；两种回答都换回英文', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { badDialog: 'Which checks?' })
+  const box = { drawn: '', id: '', input: '' }
+  dialog(on, $, box, () => ({ questions: QUESTIONS, answers: { '中Which approach?': '中Retry', 'Which checks?': 'Lint, Tests' } }))
+
+  await $.prompt.submit({ text: '帮我选个方案', wait: false, origin: { kind: 'composer' } })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTIONS })
+  expect(box.input.includes('中Which approach?')).toBe(true)
+  expect(box.input.includes('"question":"Which checks?"')).toBe(true)
+  expect(r.result.answers).toEqual({ 'Which approach?': 'Retry', 'Which checks?': 'Lint, Tests' })
 })
 
 test('思考块不翻：引擎直接画屏幕上的思考摘要，插件换不上去，翻了白花钱', async ($: any, on: any) => {
@@ -712,4 +721,60 @@ test('问答框多选又自己打了字：选的选项一字不差地换回英�
 
   const row = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'ToolResult', props: { tool_use_id: box.id, tool: 'AskUserQuestion', output: r.result, isErrored: false } })
   expect(textOf(await row.drawn()).includes('中Lint, 中Types, 顺便跑一下性能测试')).toBe(true)
+})
+
+// ---------- 第八轮：只发截图（没有文字）的消息 ----------
+
+test('只发截图（没有文字）：沿用上一条的语言；上一条是中文，回复照样翻，也照样请 Claude 用英文回复', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+
+  await $.prompt.submit({ text: '帮我看看这个', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: '[Image #4]', wait: false, origin: { kind: 'composer' } })
+  expect(seen.submitted?.text).toBe('[Image #4]')
+  expect((seen.submitted?.context ?? []).some(c => c.includes('Write your reply in English'))).toBe(true)
+  await reply($, 'The dialog opened in English.', 'img1')
+  const m = await mountReply($, 'The dialog opened in English.')
+  expect((await drawnUntil(m, '中文：The dialog opened in English.')).includes('中文：The dialog opened in English.')).toBe(true)
+})
+
+test('只发截图：上一条是英文就照旧不翻；新会话第一条只发截图按中文算', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+
+  // 新会话：第一条只发截图（带粘贴内容的占位也一样）
+  await $.prompt.submit({ text: '[Image #1] [Pasted text #1 +20 lines]', wait: false, origin: { kind: 'composer' } })
+  await reply($, 'First look.', 'img2')
+  const first = await mountReply($, 'First look.')
+  expect((await drawnUntil(first, '中文：First look.')).includes('中文：First look.')).toBe(true)
+
+  // 用英文问了一句，再只发截图：照旧英文，不翻
+  await $.prompt.submit({ text: 'what does this error mean?', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: '[Image #2]', wait: false, origin: { kind: 'composer' } })
+  const asked = seen.asks.length
+  await reply($, 'It means the port is busy.', 'img3')
+  expect(seen.asks.length).toBe(asked)
+  expect((seen.submitted?.context ?? []).some(c => c.includes('Write your reply in English'))).toBe(false)
+})
+
+test('只回一两个英文词（OK、yes）：沿用上一条的语言；上一条是中文，回复照样翻；上一条是英文就不翻', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen)
+
+  await $.prompt.submit({ text: '可以发布了吗', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: 'OK', wait: false, origin: { kind: 'composer' } })
+  expect(seen.submitted?.text).toBe('OK')
+  expect((seen.submitted?.context ?? []).some(c => c.includes('Write your reply in English'))).toBe(true)
+  await reply($, 'Publishing now.', 'ok1')
+  const m = await mountReply($, 'Publishing now.')
+  expect((await drawnUntil(m, '中文：Publishing now.')).includes('中文：Publishing now.')).toBe(true)
+
+  await $.prompt.submit({ text: 'what does this error mean?', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: 'go ahead', wait: false, origin: { kind: 'composer' } })
+  const asked = seen.asks.length
+  await reply($, 'Done.', 'ok2')
+  expect(seen.asks.length).toBe(asked)
 })

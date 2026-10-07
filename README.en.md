@@ -14,9 +14,9 @@ Use Chinese in the native `claude` CLI. Your Chinese reaches Claude only as Engl
 
 - **English only to Claude.** A translation model turns your Chinese into English, and only the English is sent. Your row still shows what you typed, and the line starting with ↳ underneath shows exactly what was sent.
 - **Chinese replies.** Claude replies in English. Each block is translated in the background as soon as it's finished, then shown in Chinese in place. You can also keep the English with the Chinese below it.
-- **Question dialogs too.** When Claude asks you something in a question dialog, the question and options show in Chinese; the options you pick and anything you type reach Claude in English. The dialog waits a few seconds for the translation before it opens.
+- **Question dialogs too.** When Claude asks you something in a question dialog, the question and options show in Chinese; the options you pick and anything you type reach Claude in English. The dialog waits a few seconds for the translation before it opens, with a "正在把问答框译成中文…" notice meanwhile.
 - **Untouched content.** Code blocks, tables, paths and commands are kept as-is.
-- **English stays English.** English messages go through unchanged, and their replies aren't translated.
+- **English stays English.** English messages go through unchanged, and their replies aren't translated. A message with only a screenshot or pasted content and no words of your own, or just one or two English words such as OK or yes, keeps the previous message's language.
 - **Menus for settings.** `/zh` opens a settings menu and `/zh-model` picks the translation model. Changes apply immediately.
 - **Consistent wording.** A glossary keeps terms consistent, and reply translations reuse the wording of your own message.
 - **Visible cost.** You can see each translation's cost and the session total, optionally in your status line. If you'd rather not see amounts, turn them off in `/zh`.
@@ -98,11 +98,12 @@ The `/zh-model` list shows an estimated price per reply block for each version. 
 
 - **The conversation is saved in English.** Both your messages and Claude's replies are stored in English; the Chinese is only how they're displayed. The plugin keeps a copy of the session's translations, so a resumed session still shows Chinese where it can.
 - **Some things stay in English:** tool calls, Claude's thinking, and permission prompts. Thinking summaries (which look like ordinary lines) are drawn by Claude Code itself, so the plugin can't translate them; to collapse them, set `"showThinkingSummaries": false` in `~/.claude/settings.json`.
-- **Dialog translation over 6 seconds:** the dialog opens in English; your answers still reach Claude in English.
+- **A dialog question that fails to translate** (an error, or over 20 seconds): that question shows in English while the others are still Chinese; your answers still reach Claude in English.
 - **`claude -p` (scripted runs) has no screen.** `/zh` and `/zh-model` reply with text only, and with the `all` scope, the last reply's translation may not finish before the program exits.
 
 ## Changelog
 
+- **0.4.1**: Dialogs are translated one question per request, in parallel: a 4-question dialog now takes about 4 seconds instead of over 8. The dialog no longer falls back to English after 6 seconds; it waits for the translation (up to 20 seconds per question) and shows a notice meanwhile. A question that fails to translate affects only that question. Fixed a screenshot-only message (no text), or a reply of just one or two English words such as OK, being treated as English, which left the replies untranslated: it now keeps the previous message's language. Tests updated for Claude Code 2.1.292.
 - **0.4.0**: Question dialogs are translated. When Claude asks you something in a question dialog, the question and options show in Chinese; the options you pick go back to Claude as the original English, anything you type is translated into English, and the answer row shows Chinese.
 - **0.3.1**: `/zh` and `/zh-model` open right away even while Claude is replying, instead of waiting for the turn to end. Settings now apply to every open window (before, turning off the cost display in one window left the others unchanged). When a translation fails, the note explains why in plain words instead of a bare code like `empty-reply`. Fixed replies stuck on "翻译中…" (translating): a reply still being translated when the plugin reloaded (for example during an upgrade) used to stay stuck; it is now translated again.
 - **0.3.0**: Choose whether translation costs are shown (the "显示翻译费用" group in the `/zh` menu, or `/zh cost on` / `/zh cost off`).
@@ -125,7 +126,7 @@ If you added the status line widget, remove it yourself.
 - **Your row:** a `UserMessage` render hook draws it in Chinese.
 - **Replies:** each reply block is translated in the background when it's stored (`session.append`), and an `AssistantMessage` render hook draws it in Chinese.
 - **Display only:** the Chinese exists only on screen; the saved conversation stays in English.
-- **Question dialogs:** when a dialog opens (`tool.call`), its question and options are translated in the background and the `AskUserQuestion` render hook draws them in Chinese; once you answer, the answer is turned into English before Claude gets it, and the `ToolResult` render hook draws the answer row in Chinese.
+- **Question dialogs:** before a dialog opens (`tool.call`), its questions and options are translated into Chinese (one request per question, sent in parallel), so it opens in Chinese; once you answer, the answer is turned into English before Claude gets it, and the `ToolResult` render hook draws the answer row in Chinese.
 - **Privacy:** translation uses your own Claude login (`$.model.complete`), never a third-party service.
 - **Tests:** the plugin ships with tests; run them with `claude plugin test ~/.claude/skills/zh-translate`.
 

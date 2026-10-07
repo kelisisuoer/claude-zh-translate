@@ -54,8 +54,6 @@ declare module 'claude-code' {
       /** 回复的英文 → 翻译 */
       replies: Record<string, Translation>
       turn: Turn
-      /** 问答框：问题文本（每题一行）→ 中文版的问题 */
-      asks: Record<string, AskQuestion[]>
       /** 问答框的回答那一行：这次调用的 id → 你看到的中文版回答 */
       answered: Record<string, AskAnswer>
       /** 本会话翻译累计（美元） */

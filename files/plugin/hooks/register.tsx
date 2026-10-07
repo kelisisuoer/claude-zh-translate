@@ -13,15 +13,17 @@ const PANE = 'zh-model'
 const SETTINGS = 'zh-settings'
 const CJK = /[㐀-鿿豈-﫿]/
 const CJK_G = /[㐀-鿿豈-﫿]/g
+// 截图、粘贴内容在消息里的占位：[Image #4]、[Pasted text #1 +20 lines]
+const PLACEHOLDER = /\[(?:Image|Pasted text)[^\]]*\]/g
 const FENCE = /^[ \t]*(```|~~~)[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*$/gm
 
 const DEFAULT_CONFIG: Config = { enabled: true, mode: 'only', scope: 'all', model: 'sonnet', showCost: true }
 const configAtom = atom({ plugin: 'zh-translate', key: 'config' } as const, DEFAULT_CONFIG)
 const sentAtom = atom({ plugin: 'zh-translate', key: 'sent' } as const, {} as Record<string, string>)
 const repliesAtom = atom({ plugin: 'zh-translate', key: 'replies' } as const, {} as Record<string, Translation>)
-const turnAtom = atom({ plugin: 'zh-translate', key: 'turn' } as const, { zh: false, prompt: '', finalTexts: [] } as Turn)
+// 新会话按中文算：插件开着就是要用中文（第一条只发截图时，回复也翻）
+const turnAtom = atom({ plugin: 'zh-translate', key: 'turn' } as const, { zh: true, prompt: '', finalTexts: [] } as Turn)
 const spentAtom = atom({ plugin: 'zh-translate', key: 'spent' } as const, 0)
-const asksAtom = atom({ plugin: 'zh-translate', key: 'asks' } as const, {} as Record<string, AskQuestion[]>)
 const answeredAtom = atom({ plugin: 'zh-translate', key: 'answered' } as const, {} as Record<string, AskAnswer>)
 
 // 每百万 token 的 API 价格（输入、输出），按它估算翻译费用
@@ -263,14 +265,14 @@ function whyFailed(r: { reason: string; status?: number }): string {
   return r.reason
 }
 
-async function translate($: any, model: string, system: string, ask: string, text: string, context = ''): Promise<Done> {
+async function translate($: any, model: string, system: string, ask: string, text: string, context = '', timeoutMs = 180000): Promise<Done> {
   const r = await $.model.complete({
     model,
     system,
     prompt: `${ask}\n\n${context ? `<context>\n${context.slice(0, 2000)}\n</context>\n\n` : ''}<text>\n${text}\n</text>`,
     effort: 'low',
     maxTokens: 16000,
-    timeoutMs: 180000,
+    timeoutMs,
   })
   const cost = costOf(model, r.usage ?? { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
   if (!r.isAnswered) return { ok: false, reason: whyFailed(r), cost }
@@ -305,11 +307,8 @@ async function translateReply($: any, en: string): Promise<void> {
 }
 
 // ---------- 问答框（AskUserQuestion） ----------
-// 先等译文这么久：译好了问答框直接以中文弹出；更慢就先弹英文
-const ASK_WAIT_MS = 6000
-
-// 问答框按问题文本认：画它的时候拿不到这次调用的 id
-const askKey = (qs: readonly { question: string }[]) => qs.map(q => q.question).join('\n')
+// 问答框每一题最多等它译这么久；超时的那一题照常显示英文
+const ASK_TIMEOUT_MS = 20000
 
 // 要翻的文字：问题、标题、说明、选项（选项的预览是代码或示意图，不翻）
 function askTexts(qs: AskQuestion[]): Record<string, string> {
@@ -352,21 +351,28 @@ function askZh(qs: AskQuestion[], zh: Record<string, unknown>): AskQuestion[] {
   return new Set(out.map(q => q.question)).size === out.length ? out : qs
 }
 
-// 问答框译成中文，存进 asksAtom，问答框跟着重画；没译成返回 null（照常显示英文）
-async function translateAsk($: any, qs: AskQuestion[]): Promise<AskQuestion[] | null> {
+// 译一题；没译成返回 null（这一题照常显示英文）
+async function translateQuestion($: any, q: AskQuestion): Promise<AskQuestion | null> {
   try {
     const c = await getConfig($)
-    const texts = JSON.stringify(askTexts(qs), null, 1)
-    const r = await translate($, c.model, TO_ZH + (await glossary($)), ASK_DIALOG, texts, (await read($, turnAtom)).prompt)
+    const texts = JSON.stringify(askTexts([q]), null, 1)
+    const r = await translate($, c.model, TO_ZH + (await glossary($)), ASK_DIALOG, texts, (await read($, turnAtom)).prompt, ASK_TIMEOUT_MS)
     await addSpent($, r.cost)
     if (!r.ok) return null
     const json = r.text.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, '')
-    const zh = askZh(qs, JSON.parse(json))
-    await update($, asksAtom, m => ({ ...m, [askKey(qs)]: zh }))
-    return zh
+    return askZh([q], JSON.parse(json))[0] ?? null
   } catch {
     return null
   }
+}
+
+// 问答框译成中文：一题一个请求，同时发（4 题的问答框整个一起译要 8 秒多，分开译 4 秒左右）。
+// 一题都没译成返回 null（照常显示英文）
+async function translateAsk($: any, qs: AskQuestion[]): Promise<AskQuestion[] | null> {
+  const parts = await Promise.all(qs.map(q => translateQuestion($, q)))
+  if (parts.every(p => !p)) return null
+  const zh = parts.map((p, i) => p ?? qs[i]!)
+  return new Set(zh.map(q => q.question)).size === zh.length ? zh : null
 }
 
 // 你在问答框里打的字：是中文就译成英文；没译成就照原样
@@ -579,6 +585,14 @@ export const register: Register = on => {
     if (text.startsWith('/')) return next(e)
     await syncConfig($)
     const c = await getConfig($)
+    // 只有截图、粘贴内容（没有你自己的话），或者只回了 OK、yes 这样一两个英文词：
+    // 沿用上一条的语言，不当成英文对话；上一条是中文，回复照样翻
+    const words = text.replace(PLACEHOLDER, '').trim()
+    const ack = words.length <= 12 && words.split(/\s+/).length <= 2
+    if (c.enabled && !CJK.test(words) && (!/[A-Za-z]/.test(words) || ack)) {
+      const turn = await update($, turnAtom, t => ({ ...t, finalTexts: [] }))
+      return next(turn.zh ? { ...e, context: [...(e.context ?? []), REPLY_EN] } : e)
+    }
     if (!c.enabled || !CJK.test(text)) {
       await update($, turnAtom, () => ({ zh: false, prompt: '', finalTexts: [] }))
       return next(e)
@@ -631,30 +645,23 @@ export const register: Register = on => {
   })
 
   // ---------- 问答框（AskUserQuestion） ----------
-  // 先等译文（最多 ASK_WAIT_MS）：译好了问答框直接以中文弹出；更慢就先弹英文，译好再换。
-  // 你答完后，回答以英文交给 Claude
+  // 先译好再弹出，问答框直接以中文显示（弹出后再换内容，引擎不会重画问答框）。
+  // 等的是翻译请求，不占钩子的时间预算。你答完后，回答以英文交给 Claude
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
     if (e.agentId !== undefined || e.tool !== 'AskUserQuestion') return next(e)
     const c = await getConfig($)
     if (!c.enabled || !(await read($, turnAtom)).zh) return next(e)
     const en = e.questions as unknown as AskQuestion[]
-    const zhJob = translateAsk($, en)
-    const early = await Promise.race([zhJob, $.clock.sleep(ASK_WAIT_MS).then(() => undefined, () => undefined)])
-    const done = await next(early ? { ...e, questions: early as any } : e)
+    $.ui.toast('正在把问答框译成中文…')
+    const zh = await translateAsk($, en)
+    const done = await next(zh ? { ...e, questions: zh as any } : e)
     if (done.deny !== undefined || done.isError) return done
-    const shown = (await zhJob) ?? en
+    const shown = zh ?? en
     const r = done.result as unknown as AskAnswer
     const enAnswer = await askAnswerEn($, en, shown, r)
     await update($, answeredAtom, m => ({ ...m, [e.tool_use_id]: askAnswerShown(en, shown, r) }))
     await saveState($)
     return { result: enAnswer as any, ...(done.context ? { context: done.context } : {}) }
-  })
-
-  on('ui.render', { component: 'AskUserQuestion' }, async ($, e, next) => {
-    const c = await read($, configAtom)
-    const zh = (await read($, asksAtom))[askKey(e.props.questions as AskQuestion[])]
-    if (!c.enabled || !zh) return next(e)
-    return next({ ...e, props: { ...e.props, questions: zh } })
   })
 
   // 问答框的回答那一行：显示你看到的中文版

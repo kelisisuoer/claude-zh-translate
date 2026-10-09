@@ -13,7 +13,7 @@ const CONFIG = norm(`${HOME}/.claude/zh-translate/config.json`)
 const mtimes: Record<string, number> = {}
 let tick = 1
 
-type Fakes = { failModel?: boolean | 'empty' | 'throw'; badDialog?: boolean | string; slowDialog?: number; dialogTimeouts?: number[]; systems?: string[]; noPane?: boolean }
+type Fakes = { http?: (e: any) => any; failModel?: boolean | 'empty' | 'throw'; badDialog?: boolean | string; slowDialog?: number; dialogTimeouts?: number[]; systems?: string[]; noPane?: boolean }
 
 // 引擎的服务调用（文件、进程、模型……）在测试里回答成 { value }；同一事件一个测试只能挂一次
 function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = {}) {
@@ -33,6 +33,8 @@ function fake(on: any, files: Record<string, string>, seen: Seen, opts: Fakes = 
     return p in files ? { value: { kind: 'file', size: files[p]!.length, mtimeMs: mtimes[p] ?? 1, isLink: false } } : { deny: `ENOENT ${p}` }
   })
   on('session.id', () => ({ value: 'sess-1' }))
+  // 外部 API：测试里没有网络，给了 http 才回答
+  on('http.fetch', ($: any, e: any) => (opts.http ? { value: opts.http(e) } : { deny: 'no network in tests' }))
   on('ui.toast', ($: any, e: any) => {
     seen.toasts.push(String(e.text ?? ''))
     return { value: undefined }
@@ -208,7 +210,7 @@ test('/zh-model 列出模型，选一个就试译、保存并关掉', async ($: 
 
   const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-model', props: { title: '翻译模型' } })
   const buttons = await pane.findAll({ type: 'Button' })
-  expect(buttons.length).toBe(11)
+  expect(buttons.length).toBe(12)
   await pane.press({ key: 'claude-haiku-4-5' })
   expect(JSON.parse(files[CONFIG] ?? '{}').model).toBe('claude-haiku-4-5')
   expect(seen.closed.includes('zh-model')).toBe(true)
@@ -309,9 +311,9 @@ test('设置菜单：按下就生效并保存，当前项标 ●；换模型跳�
   fake(on, files, seen)
 
   const desk = await $.ui.mount({ plugin: 'zh-translate', surface: 'desktop', component: 'Pane', requestId: 'zh-settings', props: { title: '中文翻译设置' } })
-  expect((await desk.findAll({ type: 'Button' })).length).toBe(10)
+  expect((await desk.findAll({ type: 'Button' })).length).toBe(11)
   const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-settings', props: { title: '中文翻译设置' } })
-  expect((await pane.findAll({ type: 'Button' })).length).toBe(10)
+  expect((await pane.findAll({ type: 'Button' })).length).toBe(11)
   const label = async (key: string) => String((await pane.find({ key }))?.props?.label ?? JSON.stringify(await pane.find({ key })))
   expect((await label('only')).includes('●')).toBe(true)
   expect((await label('both')).includes('○')).toBe(true)
@@ -777,4 +779,260 @@ test('只回一两个英文词（OK、yes）：沿用上一条的语言；上一
   const asked = seen.asks.length
   await reply($, 'Done.', 'ok2')
   expect(seen.asks.length).toBe(asked)
+})
+
+// ---------- 第九轮：外部翻译 API（DeepSeek 等） ----------
+
+const KEYFILE = norm(`${HOME}/.claude/zh-translate/api-key`)
+const DS_MODELS = {
+  object: 'list',
+  data: [
+    { id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', effort: { supported_levels: ['low', 'high', 'max'] } },
+    { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', effort: { supported_levels: ['low', 'high', 'max'] } },
+  ],
+}
+const API_CONFIG = JSON.stringify({
+  provider: 'api',
+  api: { format: 'openai', url: 'https://api.deepseek.com', model: 'deepseek-flash', models: [{ id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', effort: true }] },
+})
+
+// 假的 DeepSeek：/models 给模型列表；/chat/completions 给译文（加 DS 前缀好认）；status 不是 200 就报错
+function deepseek(requests: any[], status = 200) {
+  return (e: any) => {
+    requests.push(e)
+    if (status !== 200) return { status, ok: false, headers: {}, text: JSON.stringify({ error: { message: 'Authentication Fails, Your api key is invalid' } }) }
+    if (e.url.endsWith('/models')) return { status: 200, ok: true, headers: {}, text: JSON.stringify(DS_MODELS) }
+    const body = JSON.parse(e.init.body)
+    const user = body.messages[body.messages.length - 1].content as string
+    const text = /<text>\n([\s\S]*)\n<\/text>/.exec(user)?.[1] ?? ''
+    let out = (user.startsWith('Translate the Chinese') ? 'DS-EN: ' : 'DS中文：') + text
+    if (user.startsWith('The JSON object')) out = JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(text)).map(([k, v]) => [k, 'DS中' + v])))
+    return { status: 200, ok: true, headers: {}, text: JSON.stringify({ choices: [{ message: { content: out } }], usage: { prompt_tokens: 1000, completion_tokens: 200 } }) }
+  }
+}
+
+test('外部 API（DeepSeek）：你的消息和回复都交给它翻，不用 Claude 账号；请求带密钥、低档 effort，费用按 DeepSeek 价格算', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: API_CONFIG, [KEYFILE]: 'sk-test-0000-1234\n' }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const requests: any[] = []
+  fake(on, files, seen, { http: deepseek(requests) })
+
+  await $.prompt.submit({ text: '帮我看看日志', wait: false, origin: { kind: 'composer' } })
+  expect(seen.submitted?.text).toBe('DS-EN: 帮我看看日志')
+  expect(seen.asks.length).toBe(0)
+  expect(requests[0].url).toBe('https://api.deepseek.com/chat/completions')
+  expect(requests[0].init.method).toBe('POST')
+  expect(requests[0].init.headers.authorization).toBe('Bearer sk-test-0000-1234')
+  const body = JSON.parse(requests[0].init.body)
+  expect(body.model).toBe('deepseek-flash')
+  expect(body.effort).toBe('low')
+  expect(body.messages[0].role).toBe('system')
+
+  await reply($, 'The log shows a timeout.', 'api1')
+  const m = await mountReply($, 'The log shows a timeout.')
+  expect((await drawnUntil(m, 'DS中文：The log shows a timeout.')).includes('DS中文：The log shows a timeout.')).toBe(true)
+  expect(seen.asks.length).toBe(0)
+  // 每次 1000 输入 + 200 输出 token，按 $0.3 / $1.2 每百万：$0.00054，两次
+  expect(Math.abs(JSON.parse(files[norm(`${TMP}/claude-zh/plugin-state-sess-1.json`)]!).spent - 0.00108) < 1e-9).toBe(true)
+})
+
+test('外部 API 出错（密钥不对）：这段改用 Claude 账号翻，提示原因；一分钟内不重复提示', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: API_CONFIG, [KEYFILE]: 'sk-bad' }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const requests: any[] = []
+  fake(on, files, seen, { http: deepseek(requests, 401) })
+
+  await $.prompt.submit({ text: '帮我看看日志', wait: false, origin: { kind: 'composer' } })
+  expect(seen.submitted?.text).toBe('EN: 帮我看看日志')
+  expect(seen.toasts.some(t => t.includes('外部翻译接口出错') && t.includes('密钥不对'))).toBe(true)
+  await reply($, 'The log shows a timeout.', 'api2')
+  const m = await mountReply($, 'The log shows a timeout.')
+  expect((await drawnUntil(m, '中文：The log shows a timeout.')).includes('DS中文')).toBe(false)
+  expect(seen.toasts.filter(t => t.includes('外部翻译接口出错')).length).toBe(1)
+})
+
+test('外部 API 菜单：粘贴密钥回车就保存并自动获取模型列表，密钥只显示头尾；选模型先试译，能用才换上', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const requests: any[] = []
+  fake(on, files, seen, { http: deepseek(requests) })
+
+  const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-api', props: { title: '外部翻译 API' } })
+  expect(textOf(await pane.drawn()).includes('会发给这个服务')).toBe(true)
+  await pane.input({ key: 'key', text: ' sk-test-0000-1234 ' })
+  expect(files[KEYFILE]).toBe('sk-test-0000-1234')
+  expect(requests[0].url).toBe('https://api.deepseek.com/models')
+  let shown = textOf(await pane.drawn())
+  expect(shown.includes('sk-test-0000-1234')).toBe(false)
+  expect(shown.includes('sk-…1234')).toBe(true)
+  expect(shown.includes('找到 2 个模型')).toBe(true)
+  expect(shown.includes('DeepSeek-V4.1-Flash')).toBe(true)
+  expect(JSON.parse(files[CONFIG]!).provider).toBe('claude')
+
+  await pane.press({ key: 'm-deepseek-flash' })
+  const saved = JSON.parse(files[CONFIG]!)
+  expect(saved.provider).toBe('api')
+  expect(saved.api.model).toBe('deepseek-flash')
+  expect(saved.api.models[0].effort).toBe(true)
+  expect(JSON.stringify(saved).includes('sk-test')).toBe(false)
+  shown = textOf(await pane.drawn())
+  expect(shown.includes('已改用外部 API 翻译：DeepSeek-V4.1-Flash')).toBe(true)
+  expect(shown.includes('（正在用）')).toBe(true)
+})
+
+test('外部 API 菜单：地址要以 http(s):// 开头；没填密钥时选不了模型，Claude 账号照旧', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { http: deepseek([]) })
+
+  const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-api', props: { title: '外部翻译 API' } })
+  await pane.input({ key: 'url', text: 'api.deepseek.com' })
+  expect(textOf(await pane.drawn()).includes('地址要以 http:// 或 https:// 开头')).toBe(true)
+  await pane.press({ key: 'fetch' })
+  expect(textOf(await pane.drawn()).includes('先填密钥')).toBe(true)
+  await pane.input({ key: 'model-id', text: 'deepseek-flash' })
+  expect(JSON.parse(files[CONFIG] ?? '{"provider":"claude"}').provider).toBe('claude')
+})
+
+test('/zh-model：Claude 的模型和外部 API 的模型一起列出；选 Claude 的就改回 Claude 账号', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: API_CONFIG, [KEYFILE]: 'sk-test-0000-1234' }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  fake(on, files, seen, { http: deepseek([]) })
+  // 会话开始时读设置文件（真窗口里菜单打开前总是已经读过）
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+
+  const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-model', props: { title: '翻译模型' } })
+  const shown = textOf(await pane.drawn())
+  expect(shown.includes('外部 API（api.deepseek.com）')).toBe(true)
+  expect(shown.includes('DeepSeek-V4.1-Flash（当前）')).toBe(true)
+  expect(shown.includes('每段约 $0.0004')).toBe(true)
+  await pane.press({ key: 'claude-haiku-4-5' })
+  const saved = JSON.parse(files[CONFIG]!)
+  expect(saved.provider).toBe('claude')
+  expect(saved.model).toBe('claude-haiku-4-5')
+  expect(saved.api.model).toBe('deepseek-flash')
+})
+
+test('Anthropic 格式的外部 API：请求发到 /v1/messages，带 x-api-key 和版本头，system 单独放', async ($: any, on: any) => {
+  const files: Record<string, string> = {
+    [CONFIG]: JSON.stringify({ provider: 'api', api: { format: 'anthropic', url: 'https://api.anthropic.com', model: 'claude-haiku-4-5', models: [{ id: 'claude-haiku-4-5' }] } }),
+    [KEYFILE]: 'sk-ant-test',
+  }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const requests: any[] = []
+  fake(on, files, seen, {
+    http: (e: any) => {
+      requests.push(e)
+      return { status: 200, ok: true, headers: {}, text: JSON.stringify({ content: [{ type: 'text', text: 'ANT: hello there' }], usage: { input_tokens: 10, output_tokens: 5 } }) }
+    },
+  })
+
+  await $.prompt.submit({ text: '你好呀', wait: false, origin: { kind: 'composer' } })
+  expect(seen.submitted?.text).toBe('ANT: hello there')
+  expect(requests[0].url).toBe('https://api.anthropic.com/v1/messages')
+  expect(requests[0].init.headers['x-api-key']).toBe('sk-ant-test')
+  expect(requests[0].init.headers['anthropic-version']).toBe('2023-06-01')
+  const body = JSON.parse(requests[0].init.body)
+  expect(body.system.includes('translation step')).toBe(true)
+  expect(body.messages.length).toBe(1)
+  expect(body.effort).toBe(undefined)
+})
+
+test('/zh 状态文字写明在用外部 API；/zh api off 改回 Claude 账号', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: API_CONFIG, [KEYFILE]: 'sk-test-0000-1234' }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { http: deepseek([]) })
+
+  const on1 = await $.command.run({ command: 'zh', args: 'on', ...RUN })
+  expect(String(on1.text).includes('翻译模型：DeepSeek-V4.1-Flash（外部 API）')).toBe(true)
+  const off = await $.command.run({ command: 'zh', args: 'api off', ...RUN })
+  expect(JSON.parse(files[CONFIG]!).provider).toBe('claude')
+  expect(String(off.text).includes('翻译模型：Sonnet 5.5，')).toBe(true)
+})
+
+// ---------- 第十轮：译文共享 + 记下真正出力的模型 ----------
+
+const CACHE = norm(`${HOME}/.claude/zh-translate/cache.json`)
+const STATE = norm(`${TMP}/claude-zh/plugin-state-sess-1.json`)
+
+test('译文存在共享文件里：别的窗口（或续开的会话）直接拿来用，不再翻一遍', async ($: any, on: any) => {
+  const files: Record<string, string> = {
+    [CACHE]: JSON.stringify({
+      sent: { 'EN: 你好': { zh: '你好', at: 1 } },
+      replies: { 'Hello there.': { zh: '你好呀。', cost: 0.001, at: 1 } },
+    }),
+  }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  fake(on, files, seen)
+
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+  const row = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'UserMessage', props: { text: 'EN: 你好', origin: { kind: 'composer' }, isExpanded: false } })
+  expect(textOf(await row.drawn()).includes('你好')).toBe(true)
+  const m = await mountReply($, 'Hello there.')
+  expect(textOf(await m.drawn()).includes('你好呀。')).toBe(true)
+  expect(seen.asks.length).toBe(0)
+})
+
+test('新译好的内容写进共享文件；会话文件只留本会话的累计和在用的模型', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: API_CONFIG, [KEYFILE]: 'sk-test-0000-1234' }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { http: deepseek([]) })
+
+  await $.prompt.submit({ text: '帮我看看日志', wait: false, origin: { kind: 'composer' } })
+  await reply($, 'The log shows a timeout.', 'sc1')
+  const m = await mountReply($, 'The log shows a timeout.')
+  await drawnUntil(m, 'DS中文：The log shows a timeout.')
+
+  const cache = JSON.parse(files[CACHE]!)
+  expect(cache.replies['The log shows a timeout.'].zh).toBe('DS中文：The log shows a timeout.')
+  expect(cache.sent['DS-EN: 帮我看看日志'].zh).toBe('帮我看看日志')
+  expect(typeof cache.replies['The log shows a timeout.'].at).toBe('number')
+
+  const state = JSON.parse(files[STATE]!)
+  expect(state.using).toBe('DeepSeek-V4.1-Flash')
+  expect(state.replies).toBe(undefined)
+  expect(state.sent).toBe(undefined)
+  expect(state.spent > 0).toBe(true)
+})
+
+test('会话文件记的是这个窗口真正在用的模型：用 Claude 账号时写 Claude 的模型名', async ($: any, on: any) => {
+  const files: Record<string, string> = {}
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  fake(on, files, seen)
+
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+  expect(JSON.parse(files[STATE]!).using).toBe('Sonnet 5.5')
+  await $.command.run({ command: 'zh', args: 'model claude-haiku-4-5', ...RUN })
+  expect(JSON.parse(files[STATE]!).using).toBe('Haiku 4.5')
+})
+
+test('外部 API 出错改用 Claude：费用那一行写明是备用模型译的', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: API_CONFIG, [KEYFILE]: 'sk-bad' }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { http: deepseek([], 401) })
+
+  await $.prompt.submit({ text: '帮我看看日志', wait: false, origin: { kind: 'composer' } })
+  await reply($, 'The log shows a timeout.', 'fb1')
+  const m = await mountReply($, 'The log shows a timeout.')
+  const shown = await drawnUntil(m, '中文：The log shows a timeout.')
+  expect(shown.includes('本条 Sonnet 5.5（备用）')).toBe(true)
+  expect(shown.includes('DS中文')).toBe(false)
+})
+
+test('外部 API 和备用的 Claude 都没译成：说明里两个模型都写上', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: API_CONFIG, [KEYFILE]: 'sk-bad' }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  fake(on, files, seen, { http: deepseek([], 401), failModel: 'empty' })
+
+  await $.prompt.submit({ text: '帮我看看日志', wait: false, origin: { kind: 'composer' } })
+  await reply($, 'The log shows a timeout.', 'fb2')
+  const m = await mountReply($, 'The log shows a timeout.')
+  const shown = await drawnUntil(m, '这一段没有翻译')
+  expect(shown.includes('Sonnet 5.5（备用）')).toBe(true)
+  expect(shown.includes('DeepSeek-V4.1-Flash 先出错')).toBe(true)
+  expect(shown.includes('密钥不对')).toBe(true)
+  expect(shown.includes('The log shows a timeout.')).toBe(true)
 })

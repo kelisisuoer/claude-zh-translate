@@ -20,14 +20,18 @@ let sessionId = '';
 try { sessionId = JSON.parse(fs.readFileSync(0, 'utf8')).session_id || ''; } catch {}
 const sid = String(sessionId).replace(/[^\w-]/g, '_');
 const dir = path.join(os.tmpdir(), 'claude-zh');
+let state = {};
 let total = 0;
 try {
-  // 插件把本会话累计写在它的状态文件里
-  total = JSON.parse(fs.readFileSync(path.join(dir, `plugin-state-${sid}.json`), 'utf8')).spent || 0;
+  // 插件把本会话累计和在用的模型写在它的状态文件里
+  state = JSON.parse(fs.readFileSync(path.join(dir, `plugin-state-${sid}.json`), 'utf8'));
+  total = state.spent || 0;
 } catch {
   try { total = fs.readFileSync(path.join(dir, `cost-${sid}.log`), 'utf8').split('\n').reduce((s, l) => s + (parseFloat(l) || 0), 0); } catch {}
 }
 
-const model = config.model || 'sonnet';
+// 显示这个窗口的插件真正在用的模型。没有 using 说明这个窗口跑的是旧版插件，
+// 它不认识外部 API 的设置，用的就是 Claude 的模型——别跟着设置谎报成外部模型
+const name = state.using || prettyName(config.model || 'sonnet');
 // 设置里关了“显示翻译费用”就只显示模型
-process.stdout.write(config.showCost === false ? `译: ${prettyName(model)}` : `译: ${prettyName(model)} $${total.toFixed(3)}`);
+process.stdout.write(config.showCost === false ? `译: ${name}` : `译: ${name} $${total.toFixed(3)}`);

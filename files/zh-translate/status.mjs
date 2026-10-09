@@ -30,8 +30,10 @@ try {
   try { total = fs.readFileSync(path.join(dir, `cost-${sid}.log`), 'utf8').split('\n').reduce((s, l) => s + (parseFloat(l) || 0), 0); } catch {}
 }
 
-// 显示这个窗口的插件真正在用的模型。没有 using 说明这个窗口跑的是旧版插件，
-// 它不认识外部 API 的设置，用的就是 Claude 的模型——别跟着设置谎报成外部模型
-const name = state.using || prettyName(config.model || 'sonnet');
+// 显示这个窗口的插件真正在用的模型（0.5.1 起每个窗口自己写下来）。
+// 没有 using 的是更早的版本，只能照设置猜
+const api = config.provider === 'api' && config.api && config.api.model ? config.api : null;
+const guess = api ? ((api.models || []).find(m => m.id === api.model) || {}).name || api.model : prettyName(config.model || 'sonnet');
+const name = state.using || guess;
 // 设置里关了“显示翻译费用”就只显示模型
 process.stdout.write(config.showCost === false ? `译: ${name}` : `译: ${name} $${total.toFixed(3)}`);

@@ -268,8 +268,14 @@ const sameConfig = (a: Config, b: Config) =>
   Object.keys({ ...a, ...b }).every(k => JSON.stringify((a as any)[k]) === JSON.stringify((b as any)[k]))
 
 async function loadConfig($: any): Promise<Config> {
-  configSeen = await configMtime($)
-  const c = (await readSaved($)) ?? { ...DEFAULT_CONFIG }
+  const mt = await configMtime($)
+  const saved = await readSaved($)
+  // 设置文件在、却读不出来（多半是别的窗口正在写，读到了半个文件）：先用着手上这份，
+  // 下次再读（configSeen 不更新，所以下一次还会再试）。绝不能退回默认设置，
+  // 否则翻译模型、是否显示费用这些会莫名其妙变回去，还会被写回文件
+  if (!saved && mt >= 0) return configLoaded ? read($, configAtom) : { ...DEFAULT_CONFIG }
+  configSeen = mt
+  const c = saved ?? { ...DEFAULT_CONFIG }
   // 没变就不动，免得屏幕上的回复白白重画
   const changed = !configLoaded || !sameConfig(await read($, configAtom), c)
   if (changed) await update($, configAtom, () => c)
@@ -302,8 +308,10 @@ async function saveConfig($: any, change: Partial<Config>): Promise<Config> {
 }
 
 // 译好的内容存在一个共享文件里，所有窗口、以及对话太长后续开的新会话都用它：
-// 往回翻还是中文，同一段也不会翻两遍。按原文认，最多留 CACHE_KEEP 条，旧的先丢
-const CACHE_KEEP = 500
+// 往回翻还是中文，同一段也不会翻两遍。按原文认，旧的先丢。
+// 留这么多：500 条只够两三个小时，隔天再打开那个对话就全是英文了
+const CACHE_KEEP_REPLIES = 5000
+const CACHE_KEEP_SENT = 2000
 
 type CacheEntry = { zh: string; cost?: number; at: number }
 type Cache = { sent: Record<string, CacheEntry>; replies: Record<string, CacheEntry> }
@@ -321,21 +329,25 @@ async function readCache($: any): Promise<Cache> {
   }
 }
 
-// 新的在前，只留 CACHE_KEEP 条
-function prune(m: Record<string, CacheEntry>): Record<string, CacheEntry> {
+// 新的在前，只留 keep 条
+function prune(m: Record<string, CacheEntry>, keep: number): Record<string, CacheEntry> {
   const all = Object.entries(m)
-  if (all.length <= CACHE_KEEP) return m
-  return Object.fromEntries(all.sort((a, b) => b[1].at - a[1].at).slice(0, CACHE_KEEP))
+  if (all.length <= keep) return m
+  return Object.fromEntries(all.sort((a, b) => b[1].at - a[1].at).slice(0, keep))
 }
 
-async function saveState($: any): Promise<void> {
+// 共享的译文文件：一轮结束时写一次。它可能有几 MB，不必每译一段就重写一遍
+async function saveCache($: any): Promise<void> {
   const now = await $.clock.now()
   const old = await readCache($)
   const sent: Record<string, CacheEntry> = { ...old.sent }
   for (const [en, zh] of Object.entries(await read($, sentAtom))) sent[en] = { zh, at: old.sent[en]?.at ?? now }
   const replies: Record<string, CacheEntry> = { ...old.replies }
   for (const [en, v] of Object.entries(await read($, repliesAtom))) if (v.zh) replies[en] = { zh: v.zh, cost: v.cost, at: old.replies[en]?.at ?? now }
-  await $.fs.write(await cacheFile($), JSON.stringify({ sent: prune(sent), replies: prune(replies) }))
+  await $.fs.write(await cacheFile($), JSON.stringify({ sent: prune(sent, CACHE_KEEP_SENT), replies: prune(replies, CACHE_KEEP_REPLIES) }))
+}
+
+async function saveState($: any): Promise<void> {
   // 只属于这个会话的：问答框的回答、翻译累计，以及这个窗口真正在用的模型（状态栏读 using，
   // 旧版插件不写它，那它用的就是 Claude 的模型，状态栏不会跟着设置谎报成外部模型）
   await $.fs.write(await stateFile($), JSON.stringify({
@@ -956,6 +968,8 @@ export const register: Register = on => {
       const texts = turn.finalTexts.length ? turn.finalTexts : e.answer ? [e.answer] : []
       await Promise.all(texts.map(t => translateReply($, t)))
     }
+    // 这一轮译好的内容写进共享文件，别的窗口和以后重开这个对话都能用
+    await saveCache($)
     return done
   })
 

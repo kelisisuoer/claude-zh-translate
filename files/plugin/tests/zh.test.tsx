@@ -985,6 +985,10 @@ test('新译好的内容写进共享文件；会话文件只留本会话的累�
   const m = await mountReply($, 'The log shows a timeout.')
   await drawnUntil(m, 'DS中文：The log shows a timeout.')
 
+  // 大文件一轮写一次：这一刻还没写
+  expect(files[CACHE]).toBe(undefined)
+  await $.turn.complete({ answer: '', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+
   const cache = JSON.parse(files[CACHE]!)
   expect(cache.replies['The log shows a timeout.'].zh).toBe('DS中文：The log shows a timeout.')
   expect(cache.sent['DS-EN: 帮我看看日志'].zh).toBe('帮我看看日志')
@@ -1035,4 +1039,53 @@ test('外部 API 和备用的 Claude 都没译成：说明里两个模型都写�
   expect(shown.includes('DeepSeek-V4.1-Flash 先出错')).toBe(true)
   expect(shown.includes('密钥不对')).toBe(true)
   expect(shown.includes('The log shows a timeout.')).toBe(true)
+})
+
+test('设置文件一时读不出来（别的窗口正好在写一半）：沿用手上的设置，不退回默认；读好了再跟上', async ($: any, on: any) => {
+  const whole = (model: string) => JSON.stringify({ enabled: true, mode: 'only', scope: 'all', model, showCost: false, provider: 'claude', api: { format: 'openai', url: 'https://api.deepseek.com', model: '', models: [] } })
+  const files: Record<string, string> = { [CONFIG]: whole('claude-haiku-4-5') }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  const clock = fake(on, files, seen)
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+
+  const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-settings', props: { title: '中文翻译设置' } })
+  expect(textOf(await pane.drawn()).includes('翻译模型：Haiku 4.5（')).toBe(true)
+
+  // 别的窗口正在写，这一刻只读到半个文件
+  files[CONFIG] = '{"enabled":true,"mode":"on'
+  mtimes[CONFIG] = ++tick
+  await clock.advance(2000)
+  const half = textOf(await pane.drawn())
+  expect(half.includes('翻译模型：Haiku 4.5（')).toBe(true)
+  expect(half.includes('Sonnet 5.5')).toBe(false)
+  expect(String((await pane.find({ key: 'cost-off' }))?.props?.label).includes('●')).toBe(true)
+
+  // 对方写完了：跟着变
+  files[CONFIG] = whole('claude-sonnet-5')
+  mtimes[CONFIG] = ++tick
+  await clock.advance(2000)
+  expect(textOf(await pane.drawn()).includes('翻译模型：Sonnet 5（')).toBe(true)
+})
+
+test('设置文件读不出来时也不会把默认设置写回文件', async ($: any, on: any) => {
+  const whole = JSON.stringify({ enabled: true, mode: 'both', scope: 'final', model: 'claude-haiku-4-5', showCost: false, provider: 'api', api: { format: 'openai', url: 'https://api.deepseek.com', model: 'deepseek-flash', models: [{ id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', effort: true }] } })
+  const files: Record<string, string> = { [CONFIG]: whole, [KEYFILE]: 'sk-test-0000-1234' }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  const clock = fake(on, files, seen, { http: deepseek([]) })
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+
+  files[CONFIG] = ''
+  mtimes[CONFIG] = ++tick
+  await clock.advance(2000)
+  // 这时候改个设置：写回去的要是手上那份，不能是默认的
+  await $.command.run({ command: 'zh', args: 'cost on', ...RUN })
+  const saved = JSON.parse(files[CONFIG]!)
+  expect(saved.showCost).toBe(true)
+  expect(saved.provider).toBe('api')
+  expect(saved.api.model).toBe('deepseek-flash')
+  expect(saved.model).toBe('claude-haiku-4-5')
+  expect(saved.scope).toBe('final')
+  expect(saved.mode).toBe('both')
 })

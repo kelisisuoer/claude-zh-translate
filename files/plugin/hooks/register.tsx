@@ -31,6 +31,7 @@ const turnAtom = atom({ plugin: 'zh-translate', key: 'turn' } as const, { zh: tr
 const spentAtom = atom({ plugin: 'zh-translate', key: 'spent' } as const, 0)
 const answeredAtom = atom({ plugin: 'zh-translate', key: 'answered' } as const, {} as Record<string, AskAnswer>)
 const apiNoteAtom = atom({ plugin: 'zh-translate', key: 'apiNote' } as const, '')
+const readyAtom = atom({ plugin: 'zh-translate', key: 'ready' } as const, false)
 
 // 每百万 token 的 API 价格（输入、输出），按它估算翻译费用
 const PRICES: Record<string, [number, number]> = {
@@ -93,6 +94,10 @@ const LOAD = Math.random().toString(36).slice(2)
 let configSeen = -1
 // 状态（共享缓存 + 本会话累计）读进来了没有；没读之前不写文件
 let stateLoaded = false
+// 设置和共享译文在这个进程里的一份——它们本来就是全局的，不属于哪个会话。
+// 画消息的钩子不能写会话状态；换了会话、状态还没重新读进来的那一小会儿，就靠这一份画
+let memConfig: Config | null = null
+let memCache: Cache | null = null
 // 是不是交互界面（claude -p 这类没有界面，打不开菜单）
 let interactive = true
 
@@ -276,6 +281,7 @@ async function loadConfig($: any): Promise<Config> {
   if (!saved && mt >= 0) return configLoaded ? read($, configAtom) : { ...DEFAULT_CONFIG }
   configSeen = mt
   const c = saved ?? { ...DEFAULT_CONFIG }
+  memConfig = c
   // 没变就不动，免得屏幕上的回复白白重画
   const changed = !configLoaded || !sameConfig(await read($, configAtom), c)
   if (changed) await update($, configAtom, () => c)
@@ -299,6 +305,7 @@ async function saveConfig($: any, change: Partial<Config>): Promise<Config> {
   // 在设置文件现有的内容上改，不用本窗口记着的旧设置，免得把别的窗口刚改的设置盖回去
   const base = (await readSaved($)) ?? (await getConfig($))
   const c = { ...base, ...change }
+  memConfig = c
   await update($, configAtom, () => c)
   await $.fs.write(await configFile($), JSON.stringify(c, null, 2))
   configSeen = await configMtime($)
@@ -344,7 +351,8 @@ async function saveCache($: any): Promise<void> {
   for (const [en, zh] of Object.entries(await read($, sentAtom))) sent[en] = { zh, at: old.sent[en]?.at ?? now }
   const replies: Record<string, CacheEntry> = { ...old.replies }
   for (const [en, v] of Object.entries(await read($, repliesAtom))) if (v.zh) replies[en] = { zh: v.zh, cost: v.cost, at: old.replies[en]?.at ?? now }
-  await $.fs.write(await cacheFile($), JSON.stringify({ sent: prune(sent, CACHE_KEEP_SENT), replies: prune(replies, CACHE_KEEP_REPLIES) }))
+  memCache = { sent: prune(sent, CACHE_KEEP_SENT), replies: prune(replies, CACHE_KEEP_REPLIES) }
+  await $.fs.write(await cacheFile($), JSON.stringify(memCache))
 }
 
 async function saveState($: any): Promise<void> {
@@ -359,6 +367,7 @@ async function saveState($: any): Promise<void> {
 
 async function loadState($: any): Promise<void> {
   const cache = await readCache($)
+  memCache = cache
   await update($, sentAtom, m => ({ ...Object.fromEntries(Object.entries(cache.sent).map(([k, v]) => [k, v.zh])), ...m }))
   await update($, repliesAtom, m => ({
     ...Object.fromEntries(Object.entries(cache.replies).map(([k, v]) => [k, { zh: v.zh, cost: v.cost ?? 0 }])),
@@ -374,6 +383,33 @@ async function loadState($: any): Promise<void> {
   await update($, answeredAtom, m => ({ ...(s.answered ?? {}), ...m }))
   await update($, spentAtom, n => Math.max(n, s.spent ?? 0))
   stateLoaded = true
+}
+
+// 画界面用的设置。会话状态读过了就用它（改设置时会跟着重画）；刚换了会话还没读进来时，
+// 会话里的是默认值（翻译开着、显示费用），不能用，先用进程里那份
+async function viewConfig($: any): Promise<Config> {
+  const inState = await read($, configAtom)
+  return (await read($, readyAtom)) ? inState : memConfig ?? inState
+}
+
+// 这个会话的设置和译文读进来了没有，记在会话自己的状态里。
+// 在同一个窗口里 /clear 或 /resume 会换一个会话：插件记在会话里的东西全部回到初始值
+// （设置变回默认——翻译开着、Sonnet、显示费用；译文表是空的），而且不会再触发 session.start。
+// 上面那几个模块变量却还记着“已经读过了”。所以每个入口都先看这个标记，没了就整个重读
+let loading: Promise<void> | null = null
+async function ensureLoaded($: any): Promise<void> {
+  if (await read($, readyAtom)) return
+  if (!loading) {
+    loading = (async () => {
+      configLoaded = false
+      stateLoaded = false
+      await loadConfig($)
+      await loadState($)
+      await update($, readyAtom, () => true)
+      await saveState($)
+    })().finally(() => { loading = null })
+  }
+  await loading
 }
 
 async function glossary($: any): Promise<string> {
@@ -688,13 +724,13 @@ async function switchModel($: any, m: string): Promise<string> {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     interactive = e.isInteractive !== false
-    await loadConfig($)
-    await loadState($)
-    await saveState($)
+    // 插件刚载入（新窗口，或热重载）：不看标记，整个重读一遍
+    await update($, readyAtom, () => false)
+    await ensureLoaded($)
     // 插件重载时没译完的回复（标着“翻译中”，但不是这一份插件在译）：重新译，不然会一直显示“翻译中”
     for (const [k, v] of Object.entries(await read($, repliesAtom))) if (v.pending && v.owner !== LOAD) void translateReply($, k)
     // 每 2 秒看一眼设置文件，别的窗口改了设置这里跟着变；看一眼只读文件的修改时间
-    $.clock.every(2000, () => { void syncConfig($).catch(() => {}) })
+    $.clock.every(2000, () => { void ensureLoaded($).then(() => syncConfig($)).catch(() => {}) })
     // immediate：Claude 正在回复时打 /zh 也立刻弹出菜单，和 /model 一样，不用等这一轮结束
     await $.command.register({ name: 'zh', description: '中文翻译设置菜单（也可以直接 /zh on | off | only | both | all | final）', immediate: true })
     await $.command.register({ name: 'zh-model', description: '选择中文翻译用的模型（上下键选择）', immediate: true })
@@ -704,6 +740,7 @@ export const register: Register = on => {
   // ---------- 命令 ----------
   on('command.run', { command: 'zh' }, async ($, e) => {
     const a = e.args.trim().toLowerCase()
+    await ensureLoaded($)
     await syncConfig($)
     let c = await getConfig($)
     let note = ''
@@ -713,8 +750,8 @@ export const register: Register = on => {
       return { text: opened ? '用上下键或 Tab 选择，回车切换，Esc 关闭。' : statusText(c, await read($, spentAtom)) }
     }
     if (a === 'on' || a === 'off') c = await saveConfig($, { enabled: a === 'on' })
-    else if (a === 'only' || a === 'both') c = await saveConfig($, { enabled: true, mode: a })
-    else if (a === 'all' || a === 'final') c = await saveConfig($, { enabled: true, scope: a })
+    else if (a === 'only' || a === 'both') c = await saveConfig($, { mode: a })
+    else if (a === 'all' || a === 'final') c = await saveConfig($, { scope: a })
     else if (/^cost\s+(on|off)$/.test(a)) c = await saveConfig($, { showCost: a.endsWith('on') })
     else if (a === 'api') {
       const opened = await openPane($, API_PANE, '外部翻译 API', 26)
@@ -731,6 +768,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'zh-model' }, async $ => {
+    await ensureLoaded($)
     await syncConfig($)
     const opened = await openPane($, PANE, '翻译模型', modelRows(await getConfig($)))
     return { text: opened ? '用上下键或 Tab 选择翻译模型，回车确认，Esc 取消。' : '这里打不开选择列表，请用 /zh model <模型 ID> 切换。' }
@@ -763,13 +801,13 @@ export const register: Register = on => {
         </Box>
         <Text bold>回复怎么显示</Text>
         <Box flexDirection="row" columnGap={2}>
-          {choice('only', '只显示中文', c.mode === 'only', set({ enabled: true, mode: 'only' }), '3')}
-          {choice('both', '英文下面附中文', c.mode === 'both', set({ enabled: true, mode: 'both' }), '4')}
+          {choice('only', '只显示中文', c.mode === 'only', set({ mode: 'only' }), '3')}
+          {choice('both', '英文下面附中文', c.mode === 'both', set({ mode: 'both' }), '4')}
         </Box>
         <Text bold>翻译哪些回复</Text>
         <Box flexDirection="row" columnGap={2}>
-          {choice('all', '每条回复', c.scope === 'all', set({ enabled: true, scope: 'all' }), '5')}
-          {choice('final', '只翻每轮最后的回复', c.scope === 'final', set({ enabled: true, scope: 'final' }), '6')}
+          {choice('all', '每条回复', c.scope === 'all', set({ scope: 'all' }), '5')}
+          {choice('final', '只翻每轮最后的回复', c.scope === 'final', set({ scope: 'final' }), '6')}
         </Box>
         <Text bold>显示翻译费用</Text>
         <Box flexDirection="row" columnGap={2}>
@@ -907,6 +945,7 @@ export const register: Register = on => {
 
   // ---------- 发送前：中文译成英文，只发英文 ----------
   on('prompt.submit', async ($, e, next) => {
+    await ensureLoaded($)
     if (e.origin.kind !== 'composer' && e.origin.kind !== 'sdk') return next(e)
     const text = e.text.trim()
     if (text.startsWith('/')) return next(e)
@@ -941,6 +980,7 @@ export const register: Register = on => {
   // ---------- 回复：每段写完就在后台翻译 ----------
   on('session.append', async ($, e, next) => {
     if (e.door !== 'response' || e.agentId !== undefined || e.message.type !== 'assistant') return next(e)
+    await ensureLoaded($)
     const turn = await read($, turnAtom)
     const c = await getConfig($)
     if (!turn.zh || !c.enabled) return next(e)
@@ -962,6 +1002,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
+    await ensureLoaded($)
     const c = await getConfig($)
     const turn = await read($, turnAtom)
     if (c.enabled && c.scope === 'final' && turn.zh) {
@@ -978,6 +1019,7 @@ export const register: Register = on => {
   // 等的是翻译请求，不占钩子的时间预算。你答完后，回答以英文交给 Claude
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
     if (e.agentId !== undefined || e.tool !== 'AskUserQuestion') return next(e)
+    await ensureLoaded($)
     const c = await getConfig($)
     if (!c.enabled || !(await read($, turnAtom)).zh) return next(e)
     const en = e.questions as unknown as AskQuestion[]
@@ -996,7 +1038,7 @@ export const register: Register = on => {
   // 问答框的回答那一行：显示你看到的中文版
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
     if (e.props.tool !== 'AskUserQuestion') return next(e)
-    const c = await read($, configAtom)
+    const c = await viewConfig($)
     const shown = (await read($, answeredAtom))[e.props.tool_use_id]
     if (!c.enabled || !shown) return next(e)
     return next({ ...e, props: { ...e.props, output: shown } })
@@ -1006,15 +1048,16 @@ export const register: Register = on => {
   // 你那一行：显示你打的中文，下面一行是实际发给 Claude 的英文
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     if (e.props.origin.kind !== 'composer' && e.props.origin.kind !== 'sdk') return next(e)
-    const zh = (await read($, sentAtom))[e.props.text.trim()]
+    const zh = (await read($, sentAtom))[e.props.text.trim()] ?? memCache?.sent[e.props.text.trim()]?.zh
     if (!zh) return next(e)
     return next({ ...e, props: { ...e.props, text: `${zh}\n↳ ${e.props.text}` } })
   })
 
   // 回复：译好就换成中文；设置一改，屏幕上已有的回复跟着重画
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
-    const c = await read($, configAtom)
-    const tr = (await read($, repliesAtom))[e.props.text.trim()]
+    const c = await viewConfig($)
+    const kept = memCache?.replies[e.props.text.trim()]
+    const tr: Translation | undefined = (await read($, repliesAtom))[e.props.text.trim()] ?? (kept ? { zh: kept.zh, cost: kept.cost ?? 0 } : undefined)
     if (!c.enabled || !tr) return next(e)
     if (tr.pending) return next({ ...e, props: { ...e.props, text: `${e.props.text}\n\n*（翻译中…）*` } })
     if (!tr.zh) return next({ ...e, props: { ...e.props, text: `${e.props.text}\n\n*（这一段没有翻译，上面是英文原文。原因：${tr.by ? tr.by + ' ' : ''}${tr.error}）*` } })

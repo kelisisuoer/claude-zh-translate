@@ -82,6 +82,8 @@ declare module 'claude-code' {
       turn: Turn
       /** 外部 API 菜单里最近一句提示 */
       apiNote: string
+      /** 这个会话的设置和译文读进来了没有（换了会话就回到 false） */
+      ready: boolean
       /** 问答框的回答那一行：这次调用的 id → 你看到的中文版回答 */
       answered: Record<string, AskAnswer>
       /** 本会话翻译累计（美元） */

@@ -1089,3 +1089,97 @@ test('设置文件读不出来时也不会把默认设置写回文件', async ($
   expect(saved.scope).toBe('final')
   expect(saved.mode).toBe('both')
 })
+
+// ---------- 第十一轮：同一个窗口里换了会话（/clear、/resume） ----------
+
+// 模拟换会话：插件记在会话里的状态全部回到“没写过”，插件的模块变量还在，也没有新的 session.start
+function sessionSwitch(on: any) {
+  const box = { fresh: false }
+  const store = new Map<string, { value: unknown; version: number }>()
+  const id = (e: any) => `${e.plugin}/${e.key}/${e.id ?? ''}`
+  on('state.get', ($: any, e: any, next: any) => {
+    if (!box.fresh) return next(e)
+    const v = store.get(id(e))
+    // 测试里代替引擎回答的，要包在 { value } 里
+    return { value: v ? { value: v.value, version: v.version } : { value: undefined, version: 0 } }
+  })
+  on('state.set', ($: any, e: any, next: any) => {
+    if (!box.fresh) return next(e)
+    const version = store.get(id(e))?.version ?? 0
+    if (e.ifVersion !== undefined && e.ifVersion !== version) return { value: { isSet: false, version } }
+    store.set(id(e), { value: e.value, version: version + 1 })
+    return { value: { isSet: true, version: version + 1 } }
+  })
+  return box
+}
+const NO_API = { format: 'openai', url: 'https://api.deepseek.com', model: '', models: [] }
+
+test('同一个窗口里 /clear 或 /resume 换了会话：关着的翻译不会自己打开，模型和费用显示也不会变回默认', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: JSON.stringify({ enabled: false, mode: 'only', scope: 'all', model: 'claude-haiku-4-5', showCost: false, provider: 'claude', api: NO_API }) }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const sw = sessionSwitch(on)
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  fake(on, files, seen)
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+
+  await $.prompt.submit({ text: '帮我看看', wait: false, origin: { kind: 'composer' } })
+  expect(seen.submitted?.text).toBe('帮我看看')
+
+  sw.fresh = true // 在这个窗口里换了会话
+  await $.prompt.submit({ text: '再看一下', wait: false, origin: { kind: 'composer' } })
+  expect(seen.submitted?.text).toBe('再看一下')
+  expect((seen.submitted?.context ?? []).length).toBe(0)
+  expect(seen.asks.length).toBe(0)
+  const r = await $.command.run({ command: 'zh', args: 'cost off', ...RUN })
+  expect(String(r.text).includes('中文翻译已关闭')).toBe(true)
+  expect(String(r.text).includes('翻译模型：Haiku 4.5')).toBe(true)
+  expect(String(r.text).includes('不显示费用')).toBe(true)
+  // 也没有把默认设置写回文件
+  const saved = JSON.parse(files[CONFIG]!)
+  expect(saved.enabled).toBe(false)
+  expect(saved.model).toBe('claude-haiku-4-5')
+})
+
+test('换了会话后往回翻：旧回复和你的消息马上照样是中文，显示方式照你的设置而不是默认', async ($: any, on: any) => {
+  const files: Record<string, string> = {
+    [CONFIG]: JSON.stringify({ enabled: true, mode: 'both', scope: 'all', model: 'claude-haiku-4-5', showCost: false, provider: 'claude', api: NO_API }),
+    [CACHE]: JSON.stringify({ sent: { 'EN: 你好': { zh: '你好', at: 1 } }, replies: { 'Hello there.': { zh: '你好呀。', cost: 0.001, at: 1 } } }),
+  }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  const sw = sessionSwitch(on)
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  fake(on, files, seen)
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+
+  sw.fresh = true // 换了会话：画消息时会话状态还是空的
+  const m = await mountReply($, 'Hello there.')
+  const shown = textOf(await m.drawn())
+  expect(shown.includes('你好呀。')).toBe(true)
+  expect(shown.includes('───── 中文 ─────')).toBe(true)
+  expect(shown.includes('本条')).toBe(false)
+  const row = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'UserMessage', props: { text: 'EN: 你好', origin: { kind: 'composer' }, isExpanded: false } })
+  expect(textOf(await row.drawn()).includes('你好')).toBe(true)
+  expect(seen.asks.length).toBe(0)
+})
+
+test('翻译关着时改显示方式或翻译范围：不会顺带把翻译打开，只有“开启”才打开', async ($: any, on: any) => {
+  const files: Record<string, string> = { [CONFIG]: JSON.stringify({ enabled: false, mode: 'only', scope: 'all', model: 'sonnet', showCost: true, provider: 'claude', api: NO_API }) }
+  const seen: Seen = { asks: [], closed: [], toasts: [] }
+  on('command.register', ($: any, e: any) => ({ value: { command: e.name } }))
+  fake(on, files, seen)
+  try { await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true }) } catch {}
+
+  const pane = await $.ui.mount({ plugin: 'zh-translate', surface: 'terminal', component: 'Pane', requestId: 'zh-settings', props: { title: '中文翻译设置' } })
+  await pane.press({ key: 'both' })
+  await pane.press({ key: 'final' })
+  let saved = JSON.parse(files[CONFIG]!)
+  expect(saved.enabled).toBe(false)
+  expect(saved.mode).toBe('both')
+  expect(saved.scope).toBe('final')
+  const r = await $.command.run({ command: 'zh', args: 'all', ...RUN })
+  expect(JSON.parse(files[CONFIG]!).enabled).toBe(false)
+  expect(String(r.text).includes('中文翻译已关闭')).toBe(true)
+
+  await pane.press({ key: 'on' })
+  expect(JSON.parse(files[CONFIG]!).enabled).toBe(true)
+})
